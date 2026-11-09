@@ -11,16 +11,21 @@
 > compressed-KV flash attention (decode and prefill) that never materializes
 > the cache in FP16, ternary-weight matmul kernels, and a chunked
 > recurrent-memory kernel — on top of a compressed KV cache that fits ~3× the
-> values of FP16 in the same VRAM.
+> values of FP16 in the same VRAM. The pieces compose, they do not multiply:
+> each number here is an isolated arm against its own baseline.
 >
-> **Average result.** +15–34% end-to-end generation speed over the
-> hand-tuned baseline at deep contexts, and +49% prompt processing on
-> ternary weights at parity perplexity.
+> **Average result.** +50–70% generation speed on the 27B ternary model from
+> the decode kernels alone at 512-token to 32K depth, +49% prompt processing
+> on ternary weights at parity perplexity, and a further 1.4–2.7× end-to-end
+> from n-gram speculative decoding with byte-identical output.
 >
 > **Two verified examples.**
-> - **Bonsai-2-27B (PTQ1 ternary quants):** production server at ~80–96K context.
-> - **Qwen3.5-native 9B hybrid:** 335 tok/s at a filled 32K window; at a full
->   128K window, decode went 8.6 → 11.5 tok/s with identical greedy output.
+> - **Bonsai-2-27B (PTQ1 ternary quants):** production server at ~80–96K
+>   context; 15.3 → 26.9 tok/s on edit-style tasks and 15.3 → 41.1 tok/s on
+>   copy-style tasks with speculation, all outputs identical.
+> - **Qwen3.5-native 9B hybrid:** 335 tok/s at a filled 32K window; +15–34%
+>   decode at 32–128K depth, the top end at a full 128K window (8.6 → 11.5
+>   tok/s) with identical greedy output.
 >
 > *Every number is a paired, greedy-output-matched comparison on an idle GPU.
 > [`docs/`](docs/) keeps the logs — including the experiments that were
