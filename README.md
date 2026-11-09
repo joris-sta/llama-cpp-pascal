@@ -106,6 +106,51 @@ Build/run/flag documentation for the integrated engine is in
 ([`docs/vbr.md`](docs/vbr.md)) and the production tuning log
 ([`docs/qwen-native-turbo3.md`](docs/qwen-native-turbo3.md)).
 
+## Patching with an agent
+
+A coding agent can do the
+[Applying the changes](#applying-the-changes) flow — amendment, build, test
+cycle, and conflict resolution — from one prompt. Paste this and give it the
+paths it asks for:
+
+```text
+Apply a llama.cpp patch series to my build.
+
+Inputs you need from me (ask if not already known):
+- REPO:    the llama.cpp checkout to patch (git working tree, clean or dirty —
+           tell me if it is dirty and I will say whether to stash)
+- PATCHES: the directory holding the *.patch files from
+           joris-sta/llama-cpp-pascal (or a git remote to fetch them from)
+- CUDA:    nvcc path and CUDA architectures to build for (e.g. 61, 86)
+
+Do this end to end:
+1. Preflight: confirm REPO is a llama.cpp tree (llama.h exists, ggml/ dir),
+   print its HEAD commit, and confirm git am is available.
+2. Apply: `git am --3way "$PATCHES"/*.patch`. If a patch conflicts, stop,
+   show me the conflict and the upstream context around it, and propose a
+   resolution for my approval before continuing — do not resolve silently.
+3. Configure + build, Release, GGML_CUDA=ON with my CUDA archs and
+   GGML_CUDA_FA=ON + GGML_CUDA_TURBO_FA=ON, targets llama-server llama-bench
+   test-turbo3-native test-ptq1-pascal test-gdn-chunk-pascal.
+4. Test: run the three custom numerical tests directly, then `ctest -L cuda`.
+   All of test-turbo3-native (87 cases), test-ptq1-pascal and
+   test-gdn-chunk-pascal must pass.
+5. Debug: if anything fails to compile or a test fails, bisect the failure
+   yourself — read the error, form a hypothesis, fix or report. Report exact
+   compiler/CTEST output for anything you cannot resolve. Do NOT paper over
+   failures by relaxing tests or tolerances; if a test fails after your fix,
+   say so explicitly.
+6. Report: applied patch list, build summary, test results table
+   (pass/fail per test), and any files you modified beyond the patches.
+```
+
+Agent guardrails worth keeping, from this repository's own debugging
+campaigns: never widen a numerical tolerance to make a test pass (the
+original campaigns kept 1e-7 NMSE limits and explicitly recorded where the
+limit had to be revisited and why); do not patch around missing GGML ops —
+they mean the base tree lacks what the kernels expect; and prefer reporting
+a conflict to a resolution that silently changes kernel semantics.
+
 ## Production status
 
 - CUDA sm_61 (GTX 1070): every kernel in this repository is validated and
