@@ -90,6 +90,12 @@ Build/run/flag documentation for the integrated engine is in
 
 - [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) — the upstream
   engine and MIT license under which everything here extends.
-- Performance numbers are allserial-run, greedy-output-matched paired
-  comparisons on an idle, unclocked-forced GPU; rejected experiments are
-  documented in [`docs/`](docs/).
+- [spiritbuun/buun-llama-cpp](https://github.com/spiritbuun/buun-llama-cpp) —
+  the direct base of this work. The TurboQuant KV cache stack (TCQ codebook
+  codecs, the VBR variable-bit-rate controller) and the Bonsai ternary
+  integration are that fork's engineering; this layer is built on top of it,
+  and the file-level credit notices in its TurboQuant kernels are retained in
+  the lineage these patches apply to.
+- Performance numbers here are all serial-run, greedy-output-matched paired
+  comparisons on an idle GPU; rejected experiments are documented in
+  [`docs/`](docs/).

@@ -1,5 +1,10 @@
 # llama.cpp — Pascal Inference Fork: Project Description
 
+> **Lineage:** a fork layered on [spiritbuun/buun-llama-cpp](https://github.com/spiritbuun/buun-llama-cpp)
+> (TurboQuant TCQ KV stack, VBR controller, Bonsai ternary integration), which
+> itself extends [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp).
+> The work described below is the Pascal optimization layer on top of both.
+
 The llama.cpp fork here powers all local inference in this machine's
 agent stack (Pi). It is built around a single unglamorous constraint: the
 production GPU is a 2016 GTX 1070 — Pascal, SM 6.1, 8 GB VRAM, no tensor
