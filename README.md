@@ -4,17 +4,19 @@
   <img src="pagefront.png" alt="A cat about to start writing CUDA on its laptop sits perched on a GTX 1070 (8 GB / SM 6.1, no tensor cores); the tabby's long Turbo3-branded tail stretches out like a KV cache, labeled 80K, 128K and 262K tokens" width="100%">
 </p>
 
-**Run a 27B model with a 96K-token context on a 2016 GTX 1070.**
-No tensor cores, 8 GB of VRAM, every layer on the GPU, serving long-running
-agent sessions — on this exact hardware, a 9B hybrid fills a 32K window at
-335 tok/s and decodes 15–34% faster at 32K–128K depth than with an already
-hand-tuned compressed-KV attention kernel, while the compressed cache holds
-~3× the KV values of FP16 in the same VRAM. The ternary 27B runs production
-at ~80–96K context on this machine, and its prefill kernels were validated
-at +49% over the reference implementation on an RTX 3090 host at parity
-perplexity. Every number above is a paired comparison with identical greedy output,
-and [`docs/`](docs/) keeps the logs — including the experiments
-that were rejected and why.
+> **A 27B model with a 96K-token context, fully resident on a 2016 GTX 1070 —**
+> no tensor cores, 8 GB of VRAM, every layer on the GPU, serving real
+> agent workloads around the clock.
+>
+> | | |
+> |---|---|
+> | **Bonsai-2-27B (PTQ1 ternary quants)** | Runs in production at ~80–96K context; its Pascal prefill kernels were validated at **+49% vs the reference implementation** on an RTX 3090 host, at parity perplexity (99.46% top-token agreement). |
+> | **Qwen3.5-native 9B hybrid** | Fills a 32K window at **335 tok/s**; register-resident compressed-KV attention decodes **+15/+24/+34% faster** at 32/64/128K depth — verified at a full 128K window with identical greedy output. |
+>
+> *Everything here is paired, greedy-output-matched measurement on idle
+> hardware; the compressed KV cache holds ~3× the values of FP16 in the
+> same VRAM. [`docs/`](docs/) keeps the logs — including the experiments
+> that were rejected and why.*
 
 Fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) — with
 the TurboQuant/VBR KV stack and Bonsai ternary integration in its lineage
