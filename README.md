@@ -1,11 +1,26 @@
 # llama.cpp — pre-tensor-core (Pascal) inference optimizations
 
-Fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) rebuilt
-around a single constraint: serving large language models **entirely on a
-GTX 1070 — Pascal, SM 6.1, 8 GB VRAM, no tensor cores** — at 80K–262K token
-contexts, under sustained agentic workloads. Upstream is intact here; this
-repository publishes the engine's own additions as browsable kernel sources,
-campaign documentation, and a reviewable patch series.
+<p align="center">
+  <img src="pagefront.png" alt="A cat about to start writing CUDA on its laptop sits perched on a GTX 1070 (8 GB / SM 6.1, no tensor cores); the tabby's long Turbo3-branded tail stretches out like a KV cache, labeled 80K, 128K and 262K tokens" width="100%">
+</p>
+
+**Run a 27B model with a 96K-token context on a 2016 GTX 1070.**
+No tensor cores, 8 GB of VRAM, every layer on the GPU, serving long-running
+agent sessions — on this exact hardware, a 9B hybrid fills a 32K window at
+335 tok/s and decodes 15–34% faster at 32K–128K depth than with an already
+hand-tuned compressed-KV attention kernel, while the compressed cache holds
+~3× the KV values of FP16 in the same VRAM. The ternary 27B runs production
+at ~80–96K context on this machine, and its prefill kernels were validated
+at +49% over the reference implementation on an RTX 3090 host at parity
+perplexity. Every number above is a paired comparison with identical greedy output,
+and [`docs/`](docs/) keeps the logs — including the experiments
+that were rejected and why.
+
+Fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) — with
+the TurboQuant/VBR KV stack and Bonsai ternary integration in its lineage
+([Credits](#credits)) — rebuilt around that constraint. Upstream behavior is
+intact; this repository publishes the engine's own additions as browsable
+kernel sources, campaign documentation, and a reviewable patch series.
 
 What ships here instead of a 5,700-file fork tree:
 
