@@ -1,0 +1,1115 @@
+From 9c560ac5e49608baf70f519804b978cf38c6634f Mon Sep 17 00:00:00 2001
+From: joris-sta <joris-sta@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 21:44:43 +0200
+Subject: [PATCH] turbo3: hard-native compressed-KV flash attention tiles for
+ pre-tensor-core NVIDIA GPUs
+
+Decode path: fused per-warp decode of Turbo3 K/V inside the flash-attn
+tile for Pascal (sm_61), with shape-driven dispatch (D=128/256/512,
+GQA 2/4/6/8 groups of decoded rows shared across query heads, exact
+six-head groups at D=256). A register-resident D=256/GQA=4 variant keeps
+queries and accumulators in registers across the whole KV scan with no
+shared-memory staging or CTA barriers, selectable via
+GGML_CUDA_T3_DECODE_TILE=auto|scalar|warp1|warp4. Full-cache FP16
+materialization is unreachable for single-token decode on this cache;
+unsupported shapes abort explicitly instead of falling back.
+
+Prefill path: small multi-token Turbo3 suffix batches (N<=4 rows,
+D=128/256, masked, no ALiBi) run the same native tile
+(GGML_CUDA_T3_PREFILL=auto|off|native|tile16|tile32); llama-graph packs
+their strided queries so small verification batches never materialize KV.
+
+Query rotation is applied once through the signed FWHT kernels, and an
+opt-in per-operation CUDA event profiler (GGML_CUDA_PROFILE_OPS) is added
+for latency diagnosis. Tensor-core GPUs keep their fused MMA path; this
+native tile is the last-resort safety net for any unmatched T3 decode
+shape there.
+
+Dedicated numerical test (test-turbo3-native, 87 cases) compares
+compressed CUDA decode to FP32 CPU attention over the same decoded
+centroids, covering head sizes, GQA 1..32, chunked and unpadded
+contexts, multiple sequences, strided views, absent masks, sinks, ALiBi
+and softcapping, with and without forced CUDA graph replay.
+
+Measured on GTX 1070 (SM 6.1): 128K-depth attention microbenchmark
+8.65 -> 5.48 ms; real-model greedy-decode +15% (32K), +24% (64K),
++34% (128K) with identical output; decode +18%..+37% vs the previous
+fused tile at 11K..34K context.
+---
+ ggml/src/ggml-cuda/fattn-tile.cu           | 168 ++++++++++++++
+ ggml/src/ggml-cuda/fattn-tile.cuh          | 130 +++++++++--
+ ggml/src/ggml-cuda/fattn-turbo3-decode.cuh | 115 ++++++++++
+ ggml/src/ggml-cuda/fattn.cu                |  61 +++++
+ ggml/src/ggml-cuda/fwht.cu                 |  28 ++-
+ ggml/src/ggml-cuda/fwht.cuh                |   2 +-
+ ggml/src/ggml-cuda/ggml-cuda.cu            |  40 ++++
+ src/llama-graph.cpp                        |   9 +
+ tests/CMakeLists.txt                       |   4 +
+ tests/test-turbo3-native.cpp               | 250 +++++++++++++++++++++
+ 10 files changed, 787 insertions(+), 20 deletions(-)
+ create mode 100644 ggml/src/ggml-cuda/fattn-turbo3-decode.cuh
+ create mode 100644 tests/test-turbo3-native.cpp
+
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cu b/ggml/src/ggml-cuda/fattn-tile.cu
+index c8281497d..438a36669 100644
+--- a/ggml/src/ggml-cuda/fattn-tile.cu
++++ b/ggml/src/ggml-cuda/fattn-tile.cu
+@@ -1,6 +1,174 @@
+ #include "common.cuh"
++#include <atomic>
+ #include "fattn-tile.cuh"
+ #include "fattn-wmma-f16.cuh"
++#include "fattn-turbo3-decode.cuh"
++
++// Overrides apply to every supported head geometry; no model identifiers.
++static int turbo3_decode_tile() {
++    static const int selected = [] {
++        const char * value = getenv("GGML_CUDA_T3_DECODE_TILE");
++        if (!value || !*value || strcmp(value,"auto") == 0 || strcmp(value,"default") == 0) return 0;
++        if (strcmp(value,"scalar") == 0) return 1;
++        if (strcmp(value,"warp1") == 0 || strcmp(value,"reg1") == 0) return 2;
++        if (strcmp(value,"warp4") == 0 || strcmp(value,"reg4") == 0) return 3;
++        GGML_ABORT("GGML_CUDA_T3_DECODE_TILE must be auto, scalar, warp1 or warp4");
++    }();
++    return selected;
++}
++
++template<int D, int G, int Warps>
++static void launch_turbo3_register(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    float softcap = 0; memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(float));
++    fattn_kernel_t kernel = softcap == 0 ? flash_attn_turbo3_register<D,G,Warps,false> : flash_attn_turbo3_register<D,G,Warps,true>;
++    launch_fattn<D,1,G>(ctx,dst,kernel,Warps,0,32,false,false,false,false,32);
++#else
++    GGML_UNUSED_VARS(ctx,dst);
++    GGML_ABORT("T3 register decode requires NVIDIA CUDA");
++#endif
++}
++
++template<int D, int G>
++static bool try_turbo3_register(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const auto * q = dst->src[0];
++    const auto * k = dst->src[1];
++    const auto * v = dst->src[2];
++    const auto * mask = dst->src[3];
++    float bias = 0; memcpy(&bias,(const float *)dst->op_params+1,sizeof(float));
++    // Mixed/broadcast sequences and ALiBi keep the existing general native tile.
++    if (ggml_cuda_info().devices[ctx.device].cc != 610 || !mask || bias != 0 ||
++        q->ne[3] != k->ne[3] || q->ne[3] != v->ne[3] || q->ne[3] != mask->ne[3]) return false;
++    const int selected = turbo3_decode_tile();
++    if (selected == 1) return false;
++    // Bound live query/output vectors instead of assuming a particular model.
++    // Preserve the measured GQA4 crossover; higher register pressure and wide
++    // heads prefer a multi-warp CTA. Tiny scans avoid a large fixup grid.
++    const bool four = selected == 3 || (selected == 0 &&
++        (D == 512 || G*D > 1024 || k->ne[1] <= 512 || (D >= 256 && k->ne[1] > 65536)));
++    if (four) launch_turbo3_register<D,G,4>(ctx,dst);
++    else launch_turbo3_register<D,G,1>(ctx,dst);
++    return true;
++}
++
++template<int D, int G>
++static void launch_turbo3_decode(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const int cc = ggml_cuda_info().devices[ctx.device].cc;
++    if constexpr (D*G <= 1536) {
++        if (try_turbo3_register<D,G>(ctx,dst)) return;
++    }
++    const int nwarps = ggml_cuda_fattn_tile_get_nthreads(D,D,G,cc)/32;
++    const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(D,D,G,cc);
++    float softcap = 0; memcpy(&softcap,(const float *)dst->op_params+2,sizeof(float));
++    fattn_kernel_t kernel = softcap == 0 ? flash_attn_tile<D,D,1,G,false,true>
++                                       : flash_attn_tile<D,D,1,G,true,true>;
++    launch_fattn<D,1,G>(ctx,dst,kernel,nwarps,0,nbatch_fa,false,false,false,false,32);
++}
++
++template<int D>
++static void dispatch_turbo3_gqa(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * Q = dst->src[0];
++    const ggml_tensor * K = dst->src[1];
++    const int64_t ratio = Q->ne[2] / K->ne[2];
++    float bias = 0.0f;
++    memcpy(&bias, (const float *) dst->op_params + 1, sizeof(float));
++    // Multi-head tiles require a mask, no ALiBi and padded KV rows. Otherwise
++    // use the native single-head tile, which handles bounds and per-head slopes.
++    if (dst->src[3] && bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0) {
++        if constexpr (D <= 256) {
++            if (ratio%3 == 0 && ratio%6 != 0 && try_turbo3_register<D,3>(ctx,dst)) return;
++        }
++        if constexpr (D == 256) {
++            if (ratio%6 == 0) return launch_turbo3_decode<D, 6>(ctx, dst);
++        }
++        if (ratio % 8 == 0 && (D <= 128 || turbo3_decode_tile() == 1 || ggml_cuda_info().devices[ctx.device].cc != 610)) return launch_turbo3_decode<D, 8>(ctx, dst);
++        if (ratio % 4 == 0 && (D <= 256 || turbo3_decode_tile() == 1 || ggml_cuda_info().devices[ctx.device].cc != 610)) return launch_turbo3_decode<D, 4>(ctx, dst);
++        if (ratio % 2 == 0) return launch_turbo3_decode<D, 2>(ctx, dst);
++    }
++    launch_turbo3_decode<D, 1>(ctx, dst);
++}
++
++void ggml_cuda_flash_attn_ext_tile_turbo3_decode(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    GGML_ASSERT(dst->src[1]->type == GGML_TYPE_TURBO3_0 && dst->src[2]->type == GGML_TYPE_TURBO3_0);
++    turbo_vanilla_cb_load_fattn();
++    static std::atomic<bool> announced{false};
++    if (!announced.exchange(true, std::memory_order_relaxed)) {
++        fprintf(stderr, "T3/T3 decode: hard-native fused CUDA tile, D=%lld GQA=%lld variant=%d (no full-KV FP16 materialization)\n",
++                (long long) dst->src[0]->ne[0], (long long) (dst->src[0]->ne[2] / dst->src[1]->ne[2]), turbo3_decode_tile());
++    }
++    switch (dst->src[0]->ne[0]) {
++        case 128: return dispatch_turbo3_gqa<128>(ctx, dst);
++        case 256: return dispatch_turbo3_gqa<256>(ctx, dst);
++        case 512: return dispatch_turbo3_gqa<512>(ctx, dst);
++        default: GGML_ABORT("hard-native T3/T3 decode: unsupported head dimension");
++    }
++}
++
++template<int D, int G, int Cols, bool Softcap>
++static void launch_turbo3_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    constexpr int N = Cols/G;
++    const int cc = ggml_cuda_info().devices[ctx.device].cc;
++    const int nwarps = ggml_cuda_fattn_tile_get_nthreads(D,D,Cols,cc)/32;
++    const int batch = ggml_cuda_fattn_tile_get_nbatch_fa(D,D,Cols,cc);
++    launch_fattn<D,N,G>(ctx,dst,flash_attn_tile<D,D,N,G,Softcap,true>,nwarps,0,batch,
++                       false,false,false,false,32);
++}
++
++template<int D, int G>
++static void dispatch_turbo3_prefill_cols(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int cols, bool softcap) {
++    if (cols == -1) {
++        const int columns = int(dst->src[0]->ne[1])*G;
++        if constexpr (G <= 2) {
++            if (columns <= 2) {
++                if (softcap) return launch_turbo3_prefill<D,G,2,true>(ctx,dst);
++                return launch_turbo3_prefill<D,G,2,false>(ctx,dst);
++            }
++        }
++        if constexpr (G <= 4) {
++            if (columns <= 4) {
++                if (softcap) return launch_turbo3_prefill<D,G,4,true>(ctx,dst);
++                return launch_turbo3_prefill<D,G,4,false>(ctx,dst);
++            }
++        }
++        if (columns <= 8) {
++            if (softcap) return launch_turbo3_prefill<D,G,8,true>(ctx,dst);
++            return launch_turbo3_prefill<D,G,8,false>(ctx,dst);
++        }
++        cols = columns <= 16 ? 16 : 32;
++    }
++    if (cols == 16) {
++        if (softcap) return launch_turbo3_prefill<D,G,16,true>(ctx,dst);
++        return launch_turbo3_prefill<D,G,16,false>(ctx,dst);
++    }
++    if (softcap) return launch_turbo3_prefill<D,G,32,true>(ctx,dst);
++    return launch_turbo3_prefill<D,G,32,false>(ctx,dst);
++}
++
++template<int D>
++static void dispatch_turbo3_prefill_gqa(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int cols) {
++    float bias = 0, softcap = 0;
++    memcpy(&bias,(const float *)dst->op_params+1,sizeof(float));
++    memcpy(&softcap,(const float *)dst->op_params+2,sizeof(float));
++    const int ratio = dst->src[0]->ne[2]/dst->src[1]->ne[2];
++    if (dst->src[3] && bias == 0 && dst->src[1]->ne[1]%FATTN_KQ_STRIDE == 0) {
++        if constexpr (D == 256) {
++            if (ratio%6 == 0 && dst->src[0]->ne[1] <= 4 && try_turbo3_register<D,6>(ctx,dst)) return;
++        }
++        if (ratio%8 == 0) return dispatch_turbo3_prefill_cols<D,8>(ctx,dst,cols,softcap != 0);
++        if (ratio%4 == 0) return dispatch_turbo3_prefill_cols<D,4>(ctx,dst,cols,softcap != 0);
++        if (ratio%2 == 0) return dispatch_turbo3_prefill_cols<D,2>(ctx,dst,cols,softcap != 0);
++    }
++    dispatch_turbo3_prefill_cols<D,1>(ctx,dst,cols,softcap != 0);
++}
++
++void ggml_cuda_flash_attn_ext_tile_turbo3_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int cols) {
++    turbo_vanilla_cb_load_fattn();
++    switch (dst->src[0]->ne[0]) {
++        case 128: return dispatch_turbo3_prefill_gqa<128>(ctx,dst,cols);
++        case 256: return dispatch_turbo3_prefill_gqa<256>(ctx,dst,cols);
++        default: GGML_ABORT("native T3 prefill: unsupported dimension");
++    }
++}
+ 
+ void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * K = dst->src[1];
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
+index 7aa9cb0fb..cba6e72d6 100644
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -19,6 +19,9 @@
+     }                                                                                                 \
+ 
+ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nvidia_fp16(const int DKQ, const int DV, const int ncols) {
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 1, 64, 2, 64, 64)
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 1, 64, 2, 64, 64)
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512, 1, 64, 2, 64, 64)
+     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 40,  40,  2,  64, 2,  64,  40)
+     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 40,  40,  4, 128, 2,  64,  40)
+     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 40,  40,  8, 256, 2,  64,  40)
+@@ -69,6 +72,7 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nv
+ 
+     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  2,  64, 2,  64,  64)
+     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 2,  64,  64)
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  6, 192, 2,  64,  64)
+     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 256, 2,  64,  64)
+     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 2,  64,  64)
+     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  64,  64)
+@@ -88,6 +92,9 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nv
+ }
+ 
+ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nvidia_fp32(const int DKQ, const int DV, const int ncols) {
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 1, 64, 2, 64, 64)
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 1, 64, 2, 64, 64)
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512, 1, 64, 2, 64, 64)
+     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 40,  40,  2,  64, 2,  32,  40)
+     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 40,  40,  4, 128, 2,  32,  40)
+     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 40,  40,  8, 256, 2,  32,  40)
+@@ -138,6 +145,7 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nv
+ 
+     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  2, 128, 3,  64,  64)
+     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 3,  32,  64)
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  6, 192, 2,  32,  64)
+     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 256, 2,  32, 256)
+     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 2,  32, 128)
+     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  32,  64)
+@@ -479,9 +487,60 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
+     ggml_cuda_unroll<5>{}(load);
+ }
+ 
++// Decode compressed Turbo3 rows only when the attention tile consumes them.
++// For 6:1 GQA this lets one CTA share each decoded KV row across six queries.
++template <int nwarps, int I, int J, int J_padding, bool oob_check, bool is_value, typename T>
++static __device__ __forceinline__ void flash_attn_tile_load_turbo3(
++        const char * __restrict__ raw, T * __restrict__ tile,
++        const int stride_bytes, const int i_sup, const int j_offset) {
++    const int tid = threadIdx.y * 32 + threadIdx.x;
++#ifdef FAST_FP16_AVAILABLE
++    constexpr int cols = J / 2;
++#else
++    constexpr int cols = J;
++#endif
++    for (int idx = tid; idx < I * cols; idx += nwarps * 32) {
++        const int row = idx / cols;
++        const int col = idx % cols;
++#ifdef FAST_FP16_AVAILABLE
++        const int j = j_offset + 2 * col;
++#else
++        const int j = j_offset + col;
++#endif
++        float x = 0.0f;
++        float y = 0.0f;
++        if (!oob_check || row < i_sup) {
++            const block_turbo3_0 * blocks = (const block_turbo3_0 *) (raw + (int64_t) row * stride_bytes);
++            const block_turbo3_0 & block = blocks[j / QK_TURBO3];
++            const int p = j % QK_TURBO3;
++            const float norm = __half2float(block.norm);
++            const int ix = ((block.qs[p / 4] >> (2 * (p % 4))) & 3) |
++                           (((block.signs[p / 8] >> (p % 8)) & 1) << 2);
++            x = d_turbo_centroids_3bit_fattn[ix] * norm;
++#if TURBO3_SKEW_EXP >= 2
++            x *= is_value ? d_turbo3_ss_v_fattn[j % 128] : d_turbo3_ss_k_fattn[j % 128];
++#endif
++#ifdef FAST_FP16_AVAILABLE
++            const int p1 = p + 1;
++            const int iy = ((block.qs[p1 / 4] >> (2 * (p1 % 4))) & 3) |
++                           (((block.signs[p1 / 8] >> (p1 % 8)) & 1) << 2);
++            y = d_turbo_centroids_3bit_fattn[iy] * norm;
++#if TURBO3_SKEW_EXP >= 2
++            y *= is_value ? d_turbo3_ss_v_fattn[(j + 1) % 128] : d_turbo3_ss_k_fattn[(j + 1) % 128];
++#endif
++#endif
++        }
++#ifdef FAST_FP16_AVAILABLE
++        tile[row * (cols + J_padding) + col] = make_half2(x, y);
++#else
++        tile[row * (cols + J_padding) + col] = x;
++#endif
++    }
++}
++
+ // Function that performs a single iteration in for the KQ matrix multiplication:
+ template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int nbatch_fa, int nbatch_K,
+-    bool use_logit_softcap, bool oob_check, typename T_vec_dot>
++    bool use_logit_softcap, bool oob_check, bool turbo3, typename T_vec_dot>
+ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
+         T_vec_dot   * const Q_tmp,
+         const half2 * const __restrict__ K_h2,
+@@ -498,8 +557,14 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
+     constexpr int cpw   = ncols > nwarps ? ncols/nwarps : 1; // Q columns per warp
+     constexpr int np    = nwarps > ncols ? nwarps/ncols : 1; // number of parallel warps per Q column
+ 
+-    flash_attn_tile_load_tile<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
+-        (K_h2 + int64_t(k_VKQ_0)*stride_K2 + k_KQ_0/2, KV_tmp, stride_K2, k_VKQ_sup);
++    if constexpr (turbo3) {
++        flash_attn_tile_load_turbo3<nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check, false>(
++            (const char *) K_h2 + int64_t(k_VKQ_0) * stride_K2 * 4,
++            KV_tmp, stride_K2 * 4, k_VKQ_sup, k_KQ_0);
++    } else {
++        flash_attn_tile_load_tile<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
++            (K_h2 + int64_t(k_VKQ_0)*stride_K2 + k_KQ_0/2, KV_tmp, stride_K2, k_VKQ_sup);
++    }
+     __syncthreads();
+ 
+ #ifdef FAST_FP16_AVAILABLE
+@@ -556,7 +621,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
+ 
+ // Function that performs a single iteration of the main loop over up to nbatch_fa tokens.
+ template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int DV, int nbatch_fa, int nbatch_K,
+-    bool use_logit_softcap, bool oob_check, typename T_vec_dot, typename T_KQ, typename T_acc>
++    bool use_logit_softcap, bool oob_check, bool turbo3, typename T_vec_dot, typename T_KQ, typename T_acc>
+ static __device__ __forceinline__ void flash_attn_tile_iter(
+         T_vec_dot * const Q_tmp,
+         const half2 * const __restrict__ K_h2,
+@@ -607,12 +672,12 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
+     constexpr int nbatch_K_last = DKQ % nbatch_K;
+ #pragma unroll
+     for (int k_KQ_0 = 0; k_KQ_0 < DKQ - nbatch_K_last; k_KQ_0 += nbatch_K) {
+-        flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>(
++        flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, turbo3>(
+             Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
+     }
+-    if (nbatch_K_last > 0) {
++    if constexpr (nbatch_K_last > 0) {
+         constexpr int k_KQ_0 = DKQ - nbatch_K_last;
+-        flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K_last, use_logit_softcap, oob_check>(
++        flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K_last, use_logit_softcap, oob_check, turbo3>(
+             Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
+     }
+ 
+@@ -718,8 +783,14 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
+     static_assert(nbatch_V % np == 0, "bad nbatch_V");
+ #pragma unroll
+     for (int k0 = 0; k0 < nbatch_fa; k0 += nbatch_V) {
+-        flash_attn_tile_load_tile<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
+-            (V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2, KV_tmp, stride_V2, k_VKQ_sup - k0);
++        if constexpr (turbo3) {
++            flash_attn_tile_load_turbo3<nwarps, nbatch_V, DV, 0, oob_check, true>(
++                (const char *) V_h2 + int64_t(k_VKQ_0 + k0) * stride_V2 * 4,
++                KV_tmp, stride_V2 * 4, k_VKQ_sup - k0, 0);
++        } else {
++            flash_attn_tile_load_tile<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
++                (V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2, KV_tmp, stride_V2, k_VKQ_sup - k0);
++        }
+         __syncthreads();
+ 
+ #ifdef FAST_FP16_AVAILABLE
+@@ -788,7 +859,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
+     }
+ }
+ 
+-template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap> // D == head size
++template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool turbo3 = false> // D == head size
+ __launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_tile_get_occupancy(DKQ, DV, ncols1*ncols2))
+ static __global__ void flash_attn_tile(
+         const char * Q_ptr,
+@@ -962,14 +1033,14 @@ static __global__ void flash_attn_tile(
+         int k_VKQ_0 = blockIdx.y*nbatch_fa;
+         while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
+             constexpr bool oob_check = false;
+-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
++            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, turbo3>
+                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+                 stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+             k_VKQ_0 += gridDim.y*nbatch_fa;
+         }
+         if (k_VKQ_0 < k_VKQ_max) {
+             constexpr bool oob_check = true;
+-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
++            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, turbo3>
+                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+                 stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+         }
+@@ -977,7 +1048,7 @@ static __global__ void flash_attn_tile(
+         // Branch without out-of-bounds checks.
+         for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
+             constexpr bool oob_check = false;
+-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
++            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, turbo3>
+                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+                 stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+         }
+@@ -1175,7 +1246,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+ #endif // GGML_USE_HIP
+ 
+ #ifndef GGML_USE_HIP
+-    if constexpr (DKQ <= 256)
++    if constexpr (DKQ <= 256 && ncols2 != 6)
+ #endif // GGML_USE_HIP
+     {
+         if (Q->ne[1] > 16/ncols2) {
+@@ -1189,7 +1260,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+         }
+     }
+ 
+-    if constexpr (ncols2 <= 16) {
++    if constexpr (ncols2 <= 16 && ncols2 != 6) {
+         if (Q->ne[1] > 8/ncols2) {
+             constexpr int cols_per_block = 16;
+             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+@@ -1201,7 +1272,19 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+         }
+     }
+ 
+-    if constexpr (ncols2 <= 8) {
++    // Pascal Turbo3 decode can process the model's entire 6:1 GQA group in one
++    // tile, reusing each materialized K/V block for all six query heads.
++    if constexpr (ncols2 == 6) {
++        constexpr int cols_per_block = 6;
++        const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
++        const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
++        fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, 1, 6, use_logit_softcap>;
++        launch_fattn<DV, 1, 6>
++            (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size);
++        return;
++    }
++
++    if constexpr (ncols2 <= 8 && ncols2 != 6) {
+         if (Q->ne[1] > 4/ncols2) {
+             constexpr int cols_per_block = 8;
+             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+@@ -1257,6 +1340,18 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+     const int gqa_limit = nvidia && gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX;
+     const bool use_gqa_opt = mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
+ 
++    // Opt-in for the 6:1 Bonsai attention layers on SM 6.1. The generic
++    // Pascal path processes this GQA group as three separate 2-head tiles.
++    static const bool turbo3_gqa6 = getenv("GGML_CUDA_TURBO3_SM61_GQA6") != nullptr;
++    if constexpr (DKQ == 256 && DV == 256) {
++        if (turbo3_gqa6 && ggml_cuda_info().devices[ggml_cuda_get_device()].cc == 610 &&
++            use_gqa_opt && Q->ne[1] == 1 && K->ne[1] >= 8192 && gqa_ratio == 6 &&
++            K->type == GGML_TYPE_F16 && dst->src[2]->type == GGML_TYPE_F16) {
++            launch_fattn_tile_switch_ncols1<DKQ, DV, 6, use_logit_softcap>(ctx, dst);
++            return;
++        }
++    }
++
+     if constexpr (DKQ == 320) {
+         // This branch is only used for Mistral Small 4 which has a GQA ratio of 32.
+         // On AMD, simply use that GQA ratio with 32 columns / block since we always have enough SRAM.
+@@ -1341,6 +1436,7 @@ void ggml_cuda_flash_attn_ext_tile_case(ggml_backend_cuda_context & ctx, ggml_te
+ }
+ 
+ void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++void ggml_cuda_flash_attn_ext_tile_turbo3_decode(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ #define DECL_FATTN_TILE_CASE(DKQ, DV)                             \
+     template void ggml_cuda_flash_attn_ext_tile_case              \
+@@ -1358,3 +1454,5 @@ extern DECL_FATTN_TILE_CASE(256, 256);
+ extern DECL_FATTN_TILE_CASE(320, 256);
+ extern DECL_FATTN_TILE_CASE(512, 512);
+ extern DECL_FATTN_TILE_CASE(576, 512);
++
++void ggml_cuda_flash_attn_ext_tile_turbo3_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int cols);
+diff --git a/ggml/src/ggml-cuda/fattn-turbo3-decode.cuh b/ggml/src/ggml-cuda/fattn-turbo3-decode.cuh
+new file mode 100644
+index 000000000..bd59c40b5
+--- /dev/null
++++ b/ggml/src/ggml-cuda/fattn-turbo3-decode.cuh
+@@ -0,0 +1,115 @@
++#pragma once
++
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++
++// Pascal register attention: each warp owns a shape-selected group of query
++// heads. K/V are decoded once per warp and shared by those heads. Query columns
++// are independent CUDA blocks, including short resumed prompt suffixes.
++static __device__ __forceinline__ float turbo3_decode_coefficient(const char * row, int j) {
++    const auto & block = reinterpret_cast<const block_turbo3_0 *>(row)[j / QK_TURBO3];
++    const int p = j % QK_TURBO3;
++    const int code = ((block.qs[p/4] >> (2*(p%4))) & 3) | (((block.signs[p/8] >> (p%8)) & 1) << 2);
++    return d_turbo_centroids_3bit_fattn[code] * __half2float(block.norm);
++}
++
++template<int D, int G, int Warps, bool Softcap>
++__launch_bounds__(32*Warps, 2)
++static __global__ void flash_attn_turbo3_register(
++        const char * Q_ptr, const char * K_ptr, const char * V_ptr,
++        const char * mask_ptr, const char * sinks_ptr, const int * KV_max_ptr,
++        float * dst, float2 * dst_meta,
++        const float scale, const float max_bias, const float m0, const float m1,
++        const uint32_t n_head_log2, const float logit_softcap,
++        const int32_t ne00, const uint3 ne01, const int32_t ne02, const int32_t ne03,
++        const int32_t nb01, const int32_t nb02, const int32_t nb03,
++        const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
++        const int32_t nb11, const int32_t nb12, const int64_t nb13,
++        const int32_t nb21, const int32_t nb22, const int64_t nb23,
++        const int32_t ne31, const int32_t ne32, const int32_t ne33,
++        const int32_t nb31, const int32_t nb32, const int64_t nb33) {
++    GGML_UNUSED_VARS(KV_max_ptr,max_bias,m0,m1,n_head_log2,ne00,ne03,ne10,ne13,ne31,ne32,ne33,nb32);
++    const int lane = threadIdx.x, warp = threadIdx.y, column = blockIdx.x;
++    constexpr int J = D/32;
++    const int groups = ne02/G, seq = blockIdx.z/groups, head0 = (blockIdx.z%groups)*G;
++    const int kv_head = head0/(ne02/ne12);
++    const char * kr = K_ptr + int64_t(seq)*nb13 + kv_head*nb12;
++    const char * vr = V_ptr + int64_t(seq)*nb23 + kv_head*nb22;
++    const half * mask = reinterpret_cast<const half *>(mask_ptr + int64_t(seq)*nb33 + int64_t(column)*nb31);
++    float query[G][J], output[G][J] = {};
++    float maximum[G];
++    float denominator[G] = {};
++#pragma unroll
++    for (int h = 0; h < G; ++h) {
++        maximum[h] = -INFINITY;
++        const float * qp = reinterpret_cast<const float *>(Q_ptr + int64_t(seq)*nb03 + (head0+h)*nb02 + int64_t(column)*nb01);
++#pragma unroll
++        for (int j = 0; j < J; ++j) query[h][j] = qp[lane+32*j];
++    }
++    for (int pos = blockIdx.y*Warps+warp; pos < ne11; pos += gridDim.y*Warps) {
++        const float mask_value = __half2float(mask[pos]);
++        if (mask_value == -INFINITY) continue;
++        float key[J], value[J];
++#pragma unroll
++        for (int j = 0; j < J; ++j) {
++            key[j] = turbo3_decode_coefficient(kr + int64_t(pos)*nb11,lane+32*j);
++            value[j] = turbo3_decode_coefficient(vr + int64_t(pos)*nb21,lane+32*j);
++#if TURBO3_SKEW_EXP >= 2
++            key[j] *= d_turbo3_ss_k_fattn[(lane+32*j)%128];
++            value[j] *= d_turbo3_ss_v_fattn[(lane+32*j)%128];
++#endif
++        }
++#pragma unroll
++        for (int h = 0; h < G; ++h) {
++            float score = 0;
++#pragma unroll
++            for (int j = 0; j < J; ++j) score = fmaf(query[h][j],key[j],score);
++#pragma unroll
++            for (int offset = 16; offset > 0; offset /= 2) score += __shfl_xor_sync(0xffffffffu,score,offset);
++            score *= scale;
++            if constexpr (Softcap) score = logit_softcap*tanhf(score);
++            score += mask_value;
++            const float next = fmaxf(maximum[h],score);
++            const float rescale = next > maximum[h] ? expf(maximum[h]-next) : 1.0f;
++            const float weight = expf(score-next);
++            maximum[h] = next;
++            denominator[h] = fmaf(denominator[h],rescale,weight);
++#pragma unroll
++            for (int j = 0; j < J; ++j) output[h][j] = fmaf(value[j],weight,output[h][j]*rescale);
++        }
++    }
++    __shared__ float maxima[Warps][G], sums[Warps][G];
++    __shared__ float partial[Warps][G][D];
++#pragma unroll
++    for (int h = 0; h < G; ++h) {
++        if (lane == 0) { maxima[warp][h] = maximum[h]; sums[warp][h] = denominator[h]; }
++#pragma unroll
++        for (int j = 0; j < J; ++j) partial[warp][h][lane+32*j] = output[h][j];
++    }
++    __syncthreads();
++    // Warps write distinct query heads after the CTA-wide merge.
++    for (int h = warp; h < G; h += Warps) {
++        float top = -INFINITY;
++#pragma unroll
++        for (int w = 0; w < Warps; ++w) top = fmaxf(top,maxima[w][h]);
++        const float sink = sinks_ptr && blockIdx.y == 0 ? reinterpret_cast<const float *>(sinks_ptr)[head0+h] : -INFINITY;
++        top = fmaxf(top,sink);
++        float sum = sink != -INFINITY ? expf(sink-top) : 0;
++        float combined[J] = {};
++#pragma unroll
++        for (int w = 0; w < Warps; ++w) {
++            const float weight = sums[w][h] > 0 ? expf(maxima[w][h]-top) : 0;
++            sum += sums[w][h]*weight;
++#pragma unroll
++            for (int j = 0; j < J; ++j) combined[j] = fmaf(partial[w][h][lane+32*j],weight,combined[j]);
++        }
++        const int row = ((seq*int(ne01.z)+column)*ne02 + head0+h)*gridDim.y + blockIdx.y;
++        const float normalize = gridDim.y == 1 && sum > 0 ? 1.0f/sum : 1.0f;
++#pragma unroll
++        for (int j = 0; j < J; ++j) dst[row*D+lane+32*j] = combined[j]*normalize;
++        if (gridDim.y > 1 && lane == 0) dst_meta[row] = make_float2(top,sum);
++    }
++}
++
++
++
++#endif // NVIDIA CUDA
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index a3a0c0706..17127c406 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -2452,6 +2452,60 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+     }();
+     const bool turbo_kv = ggml_is_turbo_kv_type(K->type) || ggml_is_turbo_kv_type(V->type);
+ 
++    // Hard native T3/T3 single-token decode. Dispatch by tensor shape, not
++    // model name, a fixed GQA ratio, GPU generation or context threshold.
++    // Fail explicitly on unsupported layouts instead of materializing full KV.
++    static const int native_t3_prefill_cols = [] {
++        const char * value = getenv("GGML_CUDA_T3_PREFILL");
++        if (!value || strcmp(value,"auto") == 0) return -2;
++        if (strcmp(value,"off") == 0) return 0;
++        if (strcmp(value,"native") == 0 || strcmp(value,"tileauto") == 0) return -1;
++        if (strcmp(value,"tile16") == 0) return 16;
++        if (strcmp(value,"tile32") == 0) return 32;
++        GGML_ABORT("GGML_CUDA_T3_PREFILL must be auto, off, native, tile16 or tile32");
++    }();
++    float t3_max_bias = 0.0f;
++    memcpy(&t3_max_bias, (const float *) dst->op_params + 1, sizeof(float));
++    const int t3_ratio = int(Q->ne[2]/K->ne[2]);
++    const bool small_native_suffix = dst->src[3] && t3_max_bias == 0.0f &&
++        Q->ne[1] <= 4 && K->ne[1] >= 4096 &&
++        (t3_ratio%4 == 0 || (Q->ne[0] == 256 && t3_ratio%6 == 0));
++    const bool native_t3_prefill = native_t3_prefill_cols && Q->ne[1] > 1 &&
++        (native_t3_prefill_cols != -2 || small_native_suffix) &&
++        ggml_cuda_info().devices[ctx.device].cc == 610 &&
++        K->type == GGML_TYPE_TURBO3_0 && V->type == GGML_TYPE_TURBO3_0 &&
++        (Q->ne[0] == 128 || Q->ne[0] == 256) && ggml_is_contiguous(Q) &&
++        Q->ne[0] == K->ne[0] && Q->ne[0] == V->ne[0] &&
++        Q->ne[3] == K->ne[3] && Q->ne[3] == V->ne[3] &&
++        (!dst->src[3] || Q->ne[3] == dst->src[3]->ne[3]);
++    const bool native_t3_decode = K->type == GGML_TYPE_TURBO3_0 && V->type == GGML_TYPE_TURBO3_0 &&
++        Q->ne[1] == 1 && GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[ctx.device].cc);
++    const auto launch_native_t3 = [&]() {
++        GGML_ASSERT(Q->ne[0] == K->ne[0] && Q->ne[0] == V->ne[0]);
++        GGML_ASSERT(Q->ne[0] == 128 || Q->ne[0] == 256 || Q->ne[0] == 512);
++        GGML_ASSERT(K->ne[2] > 0 && Q->ne[2] % K->ne[2] == 0);
++        GGML_ASSERT(Q->nb[0] == sizeof(float) && K->nb[1] % 4 == 0 && V->nb[1] % 4 == 0);
++        GGML_ASSERT(ggml_is_contiguous(Q) && "hard-native T3/T3 query rotation requires contiguous Q");
++        const size_t q_size = ggml_nelements(Q) * sizeof(float);
++        q_rot_buf_ensure(ctx, q_size);
++        k_turbo_fwht_forward<<<(int) (ggml_nelements(Q) / 128), 128, 0, ctx.stream()>>>(
++            (const float *) Q->data, ctx.fattn_scratch.q_rot_buf, ggml_nelements(Q));
++        ggml_tensor Q_rot = *Q;
++        Q_rot.data = ctx.fattn_scratch.q_rot_buf;
++        ggml_tensor * Q_original = dst->src[0];
++        dst->src[0] = &Q_rot;
++        std::atomic_signal_fence(std::memory_order_seq_cst);
++        if (native_t3_prefill) ggml_cuda_flash_attn_ext_tile_turbo3_prefill(ctx,dst,native_t3_prefill_cols == -2 ? -1 : native_t3_prefill_cols);
++        else ggml_cuda_flash_attn_ext_tile_turbo3_decode(ctx, dst);
++        dst->src[0] = Q_original;
++    };
++    // Tensor-core GPUs keep their existing fused MMA fast path. Pascal/Volta
++    // immediately use the native tile; later unmatched MMA shapes use it too.
++    if ((native_t3_decode || native_t3_prefill) && !turing_mma_available(ggml_cuda_info().devices[ctx.device].cc)) {
++        launch_native_t3();
++        return;
++    }
++
+     // Fused MMA turbo: reads raw turbo bytes directly in the MMA kernel, no intermediate fp16 buffers.
+     // Phase 1: turbo4_0 matched K/V at D=128. Set GGML_TURBO_MMA_FUSED=0 to disable.
+     static const bool turbo_mma_fused = [] {
+@@ -2591,6 +2645,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+     }
+ #endif
+ 
++    // Hard native safety net: a T3/T3 decode shape that missed fused MMA must
++    // never enter the full-cache FP16 materialization fallback below.
++    if (native_t3_decode) {
++        launch_native_t3();
++        return;
++    }
++
+     if (turbo_kv && !turbo_prefill_vec && Q->ne[1] > 1 && Q->ne[0] <= 256 &&
+         (turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) ||
+          // AMD RDNA WMMA: trying D=256 prefill too after lifting the upstream DKQ<=128 cap.
+diff --git a/ggml/src/ggml-cuda/fwht.cu b/ggml/src/ggml-cuda/fwht.cu
+index 9b8d65a1f..380abaec8 100644
+--- a/ggml/src/ggml-cuda/fwht.cu
++++ b/ggml/src/ggml-cuda/fwht.cu
+@@ -212,6 +212,10 @@ static __device__ __forceinline__ void fwht_cta_1024(float * reg) {
+     }
+ }
+ 
++#if !defined(GGML_USE_HIP)
++#include "ptq1-pascal-layout.cuh"
++#endif
++template<bool pascal_ptq1 = false>
+ static __global__ void fwht_q8_1_cuda(const float * src, const float * signs,
+         block_q8_1 * dst, int blocks_per_row) {
+     constexpr int n = 1024;
+@@ -232,8 +236,17 @@ static __global__ void fwht_q8_1_cuda(const float * src, const float * signs,
+         const float amax = warp_reduce_max<QK8_1>(fabsf(x));
+         const float sum = warp_reduce_sum<QK8_1>(x);
+         const float d = amax / 127.0f;
++        const int q = amax == 0.0f ? 0 : int(roundf(x / d));
++#if !defined(GGML_USE_HIP)
++        if constexpr (pascal_ptq1) {
++            const int k = blocks_per_row * n;
++            ptq1_pascal_store_q8((uint32_t *) dst, ptq1_pascal_pitch(k), offset / k,
++                (offset % k) + j*threads + tid, q, d);
++            continue;
++        }
++#endif
+         block_q8_1 & b = dst[(offset + j * threads + tid) / QK8_1];
+-        b.qs[tid % QK8_1] = amax == 0.0f ? 0 : roundf(x / d);
++        b.qs[tid % QK8_1] = q;
+         if (tid % QK8_1 == 0) {
+             b.ds = make_half2(d, sum);
+         }
+@@ -241,14 +254,23 @@ static __global__ void fwht_q8_1_cuda(const float * src, const float * signs,
+ }
+ 
+ void ggml_cuda_fwht_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
+-                         const ggml_tensor * signs, void * dst) {
++                         const ggml_tensor * signs, void * dst, bool pascal_ptq1) {
+     constexpr int n = 1024;
+     GGML_ASSERT(src->type == GGML_TYPE_F32 && ggml_is_contiguous(src) && src->ne[0] % n == 0);
+     GGML_ASSERT(signs->type == GGML_TYPE_F32 && ggml_is_contiguous(signs) &&
+                 ggml_nelements(signs) == src->ne[0]);
+     const int64_t rows = ggml_nelements(src) / n;
+     const ggml_cuda_kernel_launch_params params(dim3(rows, 1, 1), dim3(128, 1, 1), 0, ctx.stream());
+-    ggml_cuda_kernel_launch(fwht_q8_1_cuda, params, (const float *) src->data,
++#if !defined(GGML_USE_HIP)
++    if (pascal_ptq1) {
++        ggml_cuda_kernel_launch(fwht_q8_1_cuda<true>, params, (const float *) src->data,
++            (const float *) signs->data, (block_q8_1 *) dst, int(src->ne[0] / n));
++        return;
++    }
++#else
++    GGML_UNUSED(pascal_ptq1);
++#endif
++    ggml_cuda_kernel_launch(fwht_q8_1_cuda<false>, params, (const float *) src->data,
+         (const float *) signs->data, (block_q8_1 *) dst, int(src->ne[0] / n));
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/fwht.cuh b/ggml/src/ggml-cuda/fwht.cuh
+index 1d974b2ed..6f2bc2ee5 100644
+--- a/ggml/src/ggml-cuda/fwht.cuh
++++ b/ggml/src/ggml-cuda/fwht.cuh
+@@ -7,7 +7,7 @@ bool ggml_cuda_op_fwht_signed(ggml_backend_cuda_context & ctx, const ggml_tensor
+ 
+ // Bonsai's 1024-wide transform, directly into the MMVQ activation layout.
+ void ggml_cuda_fwht_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
+-                         const ggml_tensor * signs, void * dst);
++                         const ggml_tensor * signs, void * dst, bool pascal_ptq1 = false);
+ 
+ // Fuses ternary embedding lookup, inverse rotation, and post-transform signs.
+ bool ggml_cuda_get_rows_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * rows,
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index df508178a..e8f6fa5a9 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3410,7 +3410,47 @@ static void ggml_cuda_mul_mat_id_windowed(ggml_backend_cuda_context & ctx, ggml_
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
++// Diagnostic timings are opt-in and deliberately synchronize each operation.
++// Disable regular AND step graphs when profiling; captured/replayed nodes
++// cannot provide individual timings through this eager evaluator.
++struct ggml_cuda_op_profile {
++    struct events {
++        cudaEvent_t start = nullptr, stop = nullptr;
++        events() { CUDA_CHECK(cudaEventCreate(&start)); CUDA_CHECK(cudaEventCreate(&stop)); }
++        ~events() { (void) cudaEventDestroy(start); (void) cudaEventDestroy(stop); }
++    };
++    events * timer = nullptr;
++    cudaStream_t stream = nullptr;
++    const ggml_tensor * node = nullptr;
++    ggml_cuda_op_profile(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
++        static const bool enabled = [] {
++            const char * value = getenv("GGML_CUDA_PROFILE_OPS");
++            return value && atoi(value) != 0;
++        }();
++        if (!enabled) return;
++        cudaStreamCaptureStatus status;
++        CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &status));
++        if (status != cudaStreamCaptureStatusNone || ctx.external_capture) return;
++        static thread_local std::unordered_map<int, std::unique_ptr<events>> cache;
++        auto & entry = cache[ctx.device];
++        if (!entry) entry.reset(new events);
++        timer = entry.get(); stream = ctx.stream(); node = dst;
++        CUDA_CHECK(cudaEventRecord(timer->start, stream));
++    }
++    ~ggml_cuda_op_profile() {
++        if (!timer) return;
++        CUDA_CHECK(cudaEventRecord(timer->stop, stream));
++        CUDA_CHECK(cudaEventSynchronize(timer->stop));
++        float ms = 0;
++        CUDA_CHECK(cudaEventElapsedTime(&ms, timer->start, timer->stop));
++        fprintf(stderr, "CUDA_OP_PROFILE op=%s name=%s ne1=%lld kv=%lld ms=%.6f\n",
++                ggml_op_name(node->op), node->name, (long long) node->ne[1],
++                (long long) (node->src[1] ? node->src[1]->ne[1] : 0), ms);
++    }
++};
++
+ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
++    ggml_cuda_op_profile profile(ctx, dst);
+     switch (dst->op) {
+         case GGML_OP_ARGMAX:
+             ggml_cuda_argmax(ctx, dst);
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index c4b39bd4a..01114c069 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -3152,6 +3152,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+         }
+ 
++        // The query permutation above is strided for multiple tokens. Pack
++        // small Turbo3 verification batches so the native CUDA rotation/tile
++        // path can consume them instead of materializing the entire KV in F16.
++        if (k->type == GGML_TYPE_TURBO3_0 && v->type == GGML_TYPE_TURBO3_0 &&
++                (q->ne[0] == 128 || q->ne[0] == 256) &&
++                q->ne[1] > 1 && q->ne[1] <= 4 && !ggml_is_contiguous(q)) {
++            q = ggml_cont(ctx0, q);
++        }
++
+         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 290948c0d..b21514730 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -1006,3 +1006,7 @@ if (TARGET gguf-model-data)
+     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
+     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
+ endif()
++
++llama_build(test-turbo3-native.cpp)
++target_include_directories(test-turbo3-native PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
++llama_test(test-turbo3-native NAME test-turbo3-native LABEL cuda)
+diff --git a/tests/test-turbo3-native.cpp b/tests/test-turbo3-native.cpp
+new file mode 100644
+index 000000000..7244f2f21
+--- /dev/null
++++ b/tests/test-turbo3-native.cpp
+@@ -0,0 +1,250 @@
++#include "ggml.h"
++#include "arg.h"
++#include "ggml-backend.h"
++#include "ggml-cpu.h"
++#include "ggml-impl.h"
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <random>
++#include <vector>
++#include <stdexcept>
++#include <chrono>
++#include <cstring>
++#include <cstdlib>
++
++// Logical attention Q is [D, query, head, sequence], while model projections
++// store [D, head, query, sequence] before the attention permutation.
++static std::vector<float> model_query_storage(const std::vector<float> & q,
++        int d, int queries, int heads, int sequences) {
++    std::vector<float> storage(q.size());
++    for (int seq = 0; seq < sequences; ++seq) for (int head = 0; head < heads; ++head)
++        for (int col = 0; col < queries; ++col)
++            std::copy_n(q.data()+((seq*heads+head)*queries+col)*d, d,
++                        storage.data()+((seq*queries+col)*heads+head)*d);
++    return storage;
++}
++
++// Compare CUDA compressed-cache decode with FP32 CPU attention on the SAME
++// decoded centroids, signed-FWHT query rotation, mask and attention sinks.
++// This tests the kernel, independently of model quality or quantization loss.
++static bool check(ggml_backend_t gpu, int d, int ratio, int kv, bool masked, bool sinks, float bias, float softcap, int heads = 2, int sequences = 2, int queries = 1, int prefix_rows = 0, bool strided_queries = false) {
++    std::mt19937 rng(42 + d + ratio + kv);
++    std::uniform_real_distribution<float> random(-0.5f, 0.5f);
++    std::vector<float> q(d * queries * heads * ratio * sequences);
++    std::vector<float> k(d * kv * heads * sequences), v(k.size());
++    for (auto & x : q) x = random(rng);
++    for (auto & x : k) x = random(rng);
++    for (auto & x : v) x = random(rng);
++    const auto * trait = ggml_get_type_traits(GGML_TYPE_TURBO3_0);
++    const size_t row_bytes = ggml_row_size(GGML_TYPE_TURBO3_0, d);
++    std::vector<uint8_t> kb(row_bytes * kv * heads * sequences), vb(kb.size());
++    for (int row = 0; row < kv * heads * sequences; ++row) {
++        trait->from_float_ref(k.data() + row*d, kb.data() + row*row_bytes, d);
++        trait->from_float_ref(v.data() + row*d, vb.data() + row*row_bytes, d);
++        trait->to_float(kb.data() + row*row_bytes, k.data() + row*d, d);
++        trait->to_float(vb.data() + row*row_bytes, v.data() + row*d, d);
++    }
++    std::vector<ggml_fp16_t> mask(kv * queries * sequences);
++    for (int seq = 0; seq < sequences; ++seq) {
++        for (int col = 0; col < queries; ++col) for (int i = 0; i < kv; ++i)
++            mask[(seq*queries+col)*kv+i] = ggml_fp32_to_fp16(
++                (prefix_rows ? i >= prefix_rows : i > kv-queries+col-17) ? -INFINITY : float(-(i%7))*0.1f);
++    }
++    std::vector<float> sink(heads * ratio, 0.25f);
++    const auto run = [&](ggml_backend_t backend, bool compressed) {
++        ggml_context * ctx = ggml_init({4*1024*1024, nullptr, true});
++        const bool strided = compressed && strided_queries;
++        ggml_tensor * qs = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d,
++                strided ? heads*ratio : queries, strided ? queries : heads*ratio, sequences);
++        ggml_tensor * qt = strided ? ggml_cont(ctx, ggml_permute(ctx, qs, 0, 2, 1, 3)) : qs;
++        const ggml_type type = compressed ? GGML_TYPE_TURBO3_0 : GGML_TYPE_F32;
++        // K/V views have gaps between heads and between sequences, as real caches do.
++        ggml_tensor * ks = ggml_new_tensor_4d(ctx, type, d, 2*kv, heads, sequences);
++        ggml_tensor * vs = ggml_new_tensor_4d(ctx, type, d, 2*kv, heads, sequences);
++        ggml_tensor * kt = ggml_view_4d(ctx, ks, d, kv, heads, sequences, ks->nb[1], ks->nb[2], ks->nb[3], 0);
++        ggml_tensor * vt = ggml_view_4d(ctx, vs, d, kv, heads, sequences, vs->nb[1], vs->nb[2], vs->nb[3], 0);
++        ggml_tensor * mt = masked ? ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, queries, 1, sequences) : nullptr;
++        ggml_tensor * st = sinks ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, heads*ratio) : nullptr;
++        ggml_tensor * rotated = compressed ? qt : ggml_turbo_wht(ctx, qt, 0);
++        ggml_tensor * out = ggml_flash_attn_ext(ctx, rotated, kt, vt, mt, 1.0f/std::sqrt(float(d)), bias, softcap);
++        ggml_flash_attn_ext_add_sinks(out, st);
++        ggml_prec_set_acc(out, GGML_PREC_F32);
++        ggml_cgraph * graph = ggml_new_graph(ctx);
++        ggml_build_forward_expand(graph, out);
++        ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
++        if (!buffer) throw std::runtime_error("test tensor allocation failed");
++        ggml_backend_buffer_clear(buffer, 0);
++        const auto q_storage = strided ? model_query_storage(q,d,queries,heads*ratio,sequences) : q;
++        ggml_backend_tensor_set(qs, q_storage.data(), 0, q_storage.size()*sizeof(float));
++        for (int seq = 0; seq < sequences; ++seq) for (int head = 0; head < heads; ++head) {
++            const int row = (seq*heads+head)*kv;
++            const size_t offset = seq*ks->nb[3] + head*ks->nb[2];
++            ggml_backend_tensor_set(ks, compressed ? (const void *)(kb.data()+row*row_bytes) : (const void *)(k.data()+row*d), offset, kv*(compressed ? row_bytes : d*sizeof(float)));
++            ggml_backend_tensor_set(vs, compressed ? (const void *)(vb.data()+row*row_bytes) : (const void *)(v.data()+row*d), offset, kv*(compressed ? row_bytes : d*sizeof(float)));
++        }
++        if (mt) ggml_backend_tensor_set(mt, mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
++        if (st) ggml_backend_tensor_set(st, sink.data(), 0, sink.size()*sizeof(float));
++        // Repeated CUDA evaluation exercises graph capture/replay when enabled.
++        for (int repeat = 0; repeat < (compressed ? 3 : 1); ++repeat) {
++            if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS)
++                throw std::runtime_error("test graph compute failed");
++        }
++        std::vector<float> result(ggml_nelements(out));
++        ggml_backend_tensor_get(out, result.data(), 0, result.size()*sizeof(float));
++        ggml_backend_buffer_free(buffer);
++        ggml_free(ctx);
++        return result;
++    };
++    ggml_backend_t cpu = ggml_backend_cpu_init();
++    ggml_backend_cpu_set_n_threads(cpu, 2);
++    const auto expected = run(cpu, false), actual = run(gpu, true);
++    ggml_backend_free(cpu);
++    double error = 0, energy = 0, largest = 0;
++    for (size_t i = 0; i < expected.size(); ++i) {
++        if (!std::isfinite(actual[i])) throw std::runtime_error("nonfinite CUDA output");
++        const double delta = actual[i]-expected[i];
++        error += delta*delta; energy += double(expected[i])*expected[i];
++        largest = std::max(largest, std::abs(delta));
++    }
++    const double nmse = error/std::max(energy, 1e-30);
++    const bool ok = nmse < 5e-5 && largest < 1e-3;
++    std::printf("D=%d GQA=%d KV=%d Q=%d strided_q=%d mask=%d sinks=%d bias=%.1f softcap=%.1f NMSE=%.3g max_abs=%.3g %s\n", d,ratio,kv,queries,strided_queries,masked,sinks,bias,softcap,nmse,largest,ok?"PASS":"FAIL");
++    return ok;
++}
++// End-to-end CUDA attention microbenchmark with Ornith's TKHE cache strides.
++// Keep the model weights out of this test so candidates can be swept cheaply;
++// selected variants are subsequently checked with the actual model/snapshot.
++static void benchmark(ggml_backend_t gpu, int kv, int d = 256, int ratio = 4, int queries = 1) {
++    constexpr int heads = 4;
++    auto * ctx = ggml_init({4*1024*1024, nullptr, true});
++    const bool strided = std::getenv("T3_BENCH_STRIDED") != nullptr;
++    const bool packed = std::getenv("T3_BENCH_PACK") != nullptr;
++    auto * qs = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d,
++            strided ? heads*ratio : queries, strided ? queries : heads*ratio, 1);
++    auto * q = strided ? ggml_permute(ctx, qs, 0, 2, 1, 3) : qs;
++    if (packed) q = ggml_cont(ctx,q);
++    auto * ks = ggml_new_tensor_4d(ctx, GGML_TYPE_TURBO3_0, d, heads, kv, 1);
++    auto * vs = ggml_new_tensor_4d(ctx, GGML_TYPE_TURBO3_0, d, heads, kv, 1);
++    auto * k = ggml_view_4d(ctx, ks, d, kv, heads, 1, ks->nb[2], ks->nb[1], ks->nb[3], 0);
++    auto * v = ggml_view_4d(ctx, vs, d, kv, heads, 1, vs->nb[2], vs->nb[1], vs->nb[3], 0);
++    auto * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, queries, 1, 1);
++    auto * out = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f/std::sqrt(float(d)), 0, 0);
++    ggml_prec_set_acc(out, GGML_PREC_F32);
++    auto * graph = ggml_new_graph(ctx); ggml_build_forward_expand(graph, out);
++    auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, gpu);
++    if (!buffer) throw std::runtime_error("benchmark allocation failed");
++    ggml_backend_buffer_clear(buffer, 0);
++    std::mt19937 rng(42); std::uniform_real_distribution<float> random(-0.5f,0.5f);
++    std::vector<float> query(d*queries*heads*ratio); for (auto & x : query) x = random(rng);
++    const auto q_storage = strided ? model_query_storage(query,d,queries,heads*ratio,1) : query;
++    ggml_backend_tensor_set(qs, q_storage.data(), 0, q_storage.size()*sizeof(float));
++    const auto * trait = ggml_get_type_traits(GGML_TYPE_TURBO3_0);
++    const size_t row_bytes = ggml_row_size(GGML_TYPE_TURBO3_0, d);
++    std::vector<uint8_t> encoded(row_bytes*heads*kv);
++    std::vector<float> values(d);
++    for (auto * tensor : {ks, vs}) {
++        // A 1024-position random pool, repeated into distinct cache addresses.
++        const int pool_rows = std::min(kv,1024)*heads;
++        for (int row = 0; row < pool_rows; ++row) {
++            for (auto & x : values) x = random(rng);
++            trait->from_float_ref(values.data(), encoded.data()+row*row_bytes, d);
++        }
++        for (int row = pool_rows; row < kv*heads; ++row)
++            std::memcpy(encoded.data()+row*row_bytes, encoded.data()+(row%pool_rows)*row_bytes, row_bytes);
++        ggml_backend_tensor_set(tensor, encoded.data(), 0, encoded.size());
++    }
++    for (int i = 0; i < 10; ++i) if (ggml_backend_graph_compute(gpu,graph) != GGML_STATUS_SUCCESS) throw std::runtime_error("warmup failed");
++    const int repeats = queries == 1 ? 64 : 8;
++    const auto start = std::chrono::steady_clock::now();
++    for (int i = 0; i < repeats; ++i) if (ggml_backend_graph_compute(gpu,graph) != GGML_STATUS_SUCCESS) throw std::runtime_error("benchmark failed");
++    const double ms = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count()/repeats;
++    std::vector<float> result(ggml_nelements(out)); ggml_backend_tensor_get(out,result.data(),0,result.size()*sizeof(float));
++    double checksum = 0; for (float value : result) { if (!std::isfinite(value)) throw std::runtime_error("nonfinite benchmark output"); checksum += value; }
++    std::printf("BENCH KV=%d D=%d GQA=%d Q=%d strided=%d packed=%d ms=%.6f checksum=%.9g\n",kv,d,ratio,queries,strided,packed,ms,checksum);
++    ggml_backend_buffer_free(buffer); ggml_free(ctx);
++}
++
++int main(int argc, char ** argv) {
++    if (argc >= 2 && std::strcmp(argv[1], "--layout-check") == 0) {
++        ggml_backend_load_all();
++        auto * gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU,nullptr);
++        if (!gpu) return 2;
++        bool ok = true;
++        for (const auto geometry : {std::pair<int,int>{128,4}, {128,8}, {256,6}})
++            for (int queries : {2,3,4})
++                ok = check(gpu,geometry.first,geometry.second,4096,true,false,0,0,1,2,queries,0,true) && ok;
++        ok = check(gpu,256,6,65536,true,false,0,0,1,1,2,0,true) && ok;
++        ggml_backend_free(gpu);
++        std::printf("10 model-query layout numerical cases: %s\n",ok?"PASS":"FAIL");
++        return ok ? 0 : 1;
++    }
++    if (argc >= 2 && std::strcmp(argv[1], "--bench") == 0) {
++        ggml_backend_load_all(); auto * gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU,nullptr);
++        if (!gpu) return 2;
++        if (argc >= 3) benchmark(gpu,std::stoi(argv[2]),argc>3?std::stoi(argv[3]):256,argc>4?std::stoi(argv[4]):4,argc>5?std::stoi(argv[5]):1);
++        else for (int kv : {32768,65536,131072}) benchmark(gpu,kv);
++        ggml_backend_free(gpu); return 0;
++    }
++
++    if (common_parse_kv_q8_layers("3,7,3,11-13") != std::vector<int32_t>({3,7,11,12,13})) return 1;
++    for (const char * bad : {"", "-1", "x", "3,", "3,,7", "7-3", "3--7", "65536"}) {
++        bool rejected = false;
++        try { common_parse_kv_q8_layers(bad); } catch (const std::exception &) { rejected = true; }
++        if (!rejected) { std::fprintf(stderr, "parser accepted invalid layer list: %s\n", bad); return 1; }
++    }
++    std::puts("Q8 layer-list parsing: PASS");
++    ggml_backend_load_all();
++    ggml_backend_t gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
++    if (!gpu) return 2;
++    bool ok = true;
++    int cases = 0;
++    for (int d : {128,256,512}) {
++        for (int ratio : {1,2,3,4,6,8,16,32}) for (int kv : {256,513,2048}) {
++            ok = check(gpu,d,ratio,kv,true,false,0,0) && ok; ++cases;
++        }
++        ok = check(gpu,d,4,513,false,false,0,0) && ok; ++cases;
++        ok = check(gpu,d,4,2048,true,true,0,8) && ok; ++cases;
++        ok = check(gpu,d,4,513,true,false,2,0) && ok; ++cases;
++    }
++    // Ratios 12 and 20 exercise partial groups within each KV head.
++    // Register head indexing must preserve the real ratio and sequence offsets.
++    for (int ratio : {12,20}) for (int kv : {256,513,2048}) {
++        ok = check(gpu,256,ratio,kv,true,false,0,0) && ok; ++cases;
++    }
++    for (int ratio : {4,6}) for (int kv : {16384,65536}) {
++        ok = check(gpu,256,ratio,kv,true,false,0,0) && ok; ++cases;
++    }
++    // Validate the actual 128K depth without allocating multi-gigabyte CPU views.
++    for (int ratio : {4,6}) {
++        ok = check(gpu,256,ratio,131072,true,false,0,0,1,1) && ok; ++cases;
++    }
++    // Native tiled prefill: multiple query columns, partial query tiles,
++    // odd GQA, non-padded histories, masks, sinks, softcap and ALiBi.
++    for (int d : {128,256}) for (int ratio : {1,2,3,4,6,8,12}) for (int queries : {2,17,32}) {
++        ok = check(gpu,d,ratio,256,true,false,0,0,1,1,queries) && ok; ++cases;
++    }
++    for (int d : {128,256}) {
++        ok = check(gpu,d,4,513,true,true,0,8,1,2,17) && ok; ++cases;
++        ok = check(gpu,d,3,513,false,false,0,0,1,1,17) && ok; ++cases;
++        ok = check(gpu,d,4,513,true,false,2,0,1,1,17) && ok; ++cases;
++    }
++    // Automatic short-suffix dispatch at meaningful attended depths.
++    for (int ratio : {4,6,12}) for (int queries : {2,3,4}) {
++        ok = check(gpu,256,ratio,4096,true,false,0,0,1,1,queries) && ok; ++cases;
++    }
++    for (int queries : {2,3,4}) {
++        ok = check(gpu,128,8,4096,true,false,0,0,1,1,queries) && ok; ++cases;
++    }
++    for (int ratio : {4,6}) {
++        ok = check(gpu,256,ratio,131072,true,false,0,0,1,1,4) && ok; ++cases;
++        ok = check(gpu,256,ratio,65536,true,true,0,0,1,1,1,3) && ok; ++cases;
++    }
++    for (int d : {128,256}) {
++        ok = check(gpu,d,9,2048,true,false,0,0,1,1) && ok; ++cases;
++    }
++    ok = check(gpu,256,24,2048,true,false,0,0,1,1) && ok; ++cases;
++    ggml_backend_free(gpu);
++    std::printf("%d numerical cases: %s\n",cases,ok?"PASS":"FAIL");
++    return ok ? 0 : 1;
++}
+-- 
+2.43.0
+

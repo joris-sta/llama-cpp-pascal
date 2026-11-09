@@ -1,0 +1,925 @@
+From b2a7741cd881e5ed1cc8af10c48795a66a2c6a23 Mon Sep 17 00:00:00 2001
+From: joris-sta <joris-sta@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 21:45:18 +0200
+Subject: [PATCH] server: retention memory budgets, checkpoint anchor
+ authority, atomic tool-call publication
+
+Persistent resume store disk budgets: --resume-max-mib plus an adjacent
+--resume-budget-path directory folded into accounting by recursive,
+symlink-safe byte counting. Eviction frees only the store's own entries,
+never external files; unreadable roots are treated as "no evidence",
+not as license to evict. make_room() protects live slot ids and
+prefers retained favorites, and free_bytes() clamps to the budget.
+
+Context checkpoint authority: a checkpoint may only replace the earliest
+representative of a mandatory turn bucket when replay-boundedness and
+retention-turn scoring prove coverage anchoring
+(server_cache_checkpoint_anchor_covered); the attempt latch tracks task
+ids so consecutive requests of the same task reuse lanes correctly.
+Large MTP checkpoints no longer enlarge the displaced host capture
+budget (--checkpoint-max-mib). /props-style metadata gains a
+cache_identity (token count + retention token digest + sequence epoch)
+for cross-restart lineage checks at cache planning.
+
+Streaming tool calls are atomic for the PEG-native parser: partial
+parses no longer retract published SSE prefixes or expose half-parsed
+tools; native tool calls are held until a strict final parse and
+published in one diff, malformed final tool requests degrade to a text
+notice instead of aborting the stream, and the qwen3-coder
+parameter-framing grammar can no longer swallow subsequent calls after
+a mismatches closing tag (delimiters kept outside values so constrained
+sampling must close each parameter).
+
+Reasoning budget: a prefill that already contains a closed thinking
+block ends the budget before any forced message, instead of leaking the
+forced message into the final answer (RFC committed with regression
+tests). CLI shows generated-token counts from server timings.
+---
+ common/chat.cpp                           |   7 +-
+ common/parsers/qwen3-coder.cpp            |  14 ++-
+ common/reasoning-budget.cpp               |  10 +++
+ tests/test-arg-parser.cpp                 |  17 ++++
+ tests/test-reasoning-budget.cpp           |  19 ++++
+ tests/test-server-prompt-cache.cpp        |  51 ++++++++++-
+ tests/test-server-resume-store.cpp        |  49 ++++++++++
+ tools/server/server-cache-authority.cpp   |  18 ++++
+ tools/server/server-cache-authority.h     |  24 ++++-
+ tools/server/server-context.cpp           | 103 +++++++++++++++++++---
+ tools/server/server-resume-store.cpp      |  50 ++++++++++-
+ tools/server/server-resume-store.h        |   6 ++
+ tools/server/server-retention-sidecar.cpp |   1 +
+ tools/server/server-retention-sidecar.h   |   1 +
+ tools/server/server-task.cpp              |  42 ++++++++-
+ tools/server/server-task.h                |   1 +
+ 16 files changed, 392 insertions(+), 21 deletions(-)
+
+diff --git a/common/chat.cpp b/common/chat.cpp
+index 3a204e12d..4cc643de2 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -1452,7 +1452,10 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
+ 
+     //LOG_DBG("Parsing PEG input with format %s: %s\n", common_chat_format_name(params.format), effective_input.c_str());
+ 
+-    common_peg_parse_flags flags = COMMON_PEG_PARSE_FLAG_LENIENT;
++    // Native tool calls are published at EOF: an unfinished parse is no longer
++    // a valid partial response and must not become a successful text-only stop.
++    const bool final_native = !is_partial && params.format == COMMON_CHAT_FORMAT_PEG_NATIVE;
++    common_peg_parse_flags flags = final_native ? COMMON_PEG_PARSE_FLAG_NONE : COMMON_PEG_PARSE_FLAG_LENIENT;
+     if (params.debug) {
+         flags |= COMMON_PEG_PARSE_FLAG_DEBUG;
+     }
+@@ -1460,7 +1463,7 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
+     common_peg_parse_context ctx(effective_input, flags);
+     auto result = parser.parse(ctx);
+ 
+-    if (result.fail()) {
++    if (result.fail() || (final_native && (!result.success() || result.end != effective_input.size()))) {
+         // During partial parsing, return partial results if any AST nodes were captured
+         // This allows streaming to work correctly for formats like FUNC_MARKDOWN_CODE_BLOCK
+         if (is_partial && result.end > 0) {
+diff --git a/common/parsers/qwen3-coder.cpp b/common/parsers/qwen3-coder.cpp
+index 7938a2027..7ae01da3b 100644
+--- a/common/parsers/qwen3-coder.cpp
++++ b/common/parsers/qwen3-coder.cpp
+@@ -89,7 +89,19 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
+         if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+             auto arg_close  = p.tool_arg_close(p.literal("\n</parameter>\n"));
+             auto arg_string = p.rule("xml-arg-string",
+-                p.ac(p.tool_arg_string_value(p.until("\n</parameter>\n")) + arg_close, "\n</parameter>\n"));
++                // Function/call framing cannot belong to an unterminated
++                // parameter. Otherwise a mistaken closing tag lets one string
++                // swallow subsequent calls until the generation limit. Keep
++                // these line-delimited protocol markers outside the value so
++                // constrained sampling must close the parameter first.
++                // Do not wrap this in ac(): ac's grammar generator replaces
++                // its child with an unrestricted scan to the closing tag.
++                // Tool deltas are committed at EOF, so partial parses need no
++                // synthetic closing delimiter to expose unfinished arguments.
++                p.tool_arg_string_value(p.until_one_of({
++                    "\n</parameter>\n", "\n</function>\n", "\n</tool_call>",
++                    "\n<tool_call>", "\n<function="
++                })) + arg_close);
+ 
+             auto tool_choice = p.choice();
+             foreach_function(inputs.tools, [&](const json & tool) {
+diff --git a/common/reasoning-budget.cpp b/common/reasoning-budget.cpp
+index 4884299f3..bdcf32e49 100644
+--- a/common/reasoning-budget.cpp
++++ b/common/reasoning-budget.cpp
+@@ -135,6 +135,16 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
+         {
+             // track the end sequence within forced_tokens so it is also reported on DONE
+             const int32_t match = ctx->end_matcher.advance(token);
++            // Prefill can already contain a closed thinking block (notably
++            // thinking-off templates with a zero budget). Its actual end wins
++            // over a pending forced message; otherwise that message can spill
++            // into the final answer after prefill finishes.
++            if (match >= 0) {
++                ctx->state = REASONING_BUDGET_DONE;
++                ctx->end_match = match;
++                ctx->force_pos = ctx->forced_tokens.size();
++                break;
++            }
+             ctx->force_pos++;
+             if (ctx->force_pos >= ctx->forced_tokens.size()) {
+                 ctx->state = REASONING_BUDGET_DONE;
+diff --git a/tests/test-arg-parser.cpp b/tests/test-arg-parser.cpp
+index eed7dbbb4..20ecd200a 100644
+--- a/tests/test-arg-parser.cpp
++++ b/tests/test-arg-parser.cpp
+@@ -432,6 +432,23 @@ static void test(void) {
+ 
+     std::vector<std::string> argv;
+ 
++    // Large paired MTP checkpoints must not enlarge the displaced host cache.
++    {
++        common_params checkpoint_params;
++        argv = {"binary_name", "--cache-ram", "64", "--checkpoint-max-mib", "192"};
++        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), checkpoint_params, LLAMA_EXAMPLE_SERVER));
++        assert(checkpoint_params.cache_ram_mib == 64);
++        assert(checkpoint_params.checkpoint_max_mib == 192);
++        for (const auto & value : {"-1", "0"}) {
++            common_params limit_params;
++            argv = {"binary_name", "--checkpoint-max-mib", value};
++            assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), limit_params, LLAMA_EXAMPLE_SERVER));
++            assert(limit_params.checkpoint_max_mib == std::stoi(value));
++        }
++        argv = {"binary_name", "--checkpoint-max-mib", "-2"};
++        assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), checkpoint_params, LLAMA_EXAMPLE_SERVER));
++    }
++
+     printf("test-arg-parser: test invalid usage\n\n");
+ 
+     // missing value
+diff --git a/tests/test-reasoning-budget.cpp b/tests/test-reasoning-budget.cpp
+index 3bcc77e17..4fda61f9d 100644
+--- a/tests/test-reasoning-budget.cpp
++++ b/tests/test-reasoning-budget.cpp
+@@ -151,6 +151,24 @@ static llama_token get_forced_token(struct llama_sampler * sampler, llama_token
+     return finite_token;
+ }
+ 
++static void test_closed_prefill_cancels_forced_message() {
++    // Thinking-off templates prefill an empty, already closed block. With a
++    // zero budget, accepting the start tag enters FORCING before that closing
++    // tag is consumed. A long forced message must not leak into generation.
++    for (const auto & end : std::vector<llama_tokens>{{101}, {101, 102}}) {
++        llama_tokens forced = {110, 111, 112, 113, 114, 115, 116};
++        forced.insert(forced.end(), end.begin(), end.end());
++        auto * sampler = common_reasoning_budget_init(nullptr, {{100}}, {end}, forced, 0, REASONING_BUDGET_IDLE);
++        llama_sampler_accept(sampler, 100);
++        llama_sampler_accept(sampler, 50); // prefilled newline
++        for (auto token : end) llama_sampler_accept(sampler, token);
++        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_DONE);
++        llama_sampler_accept(sampler, 51); // final-answer prefix
++        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_DONE);
++        llama_sampler_free(sampler);
++    }
++}
++
+ static void test_reasoning_budget_clone_mid_counting() {
+     const std::vector<llama_token> start = {100};
+     const std::vector<llama_token> end = {101};
+@@ -490,6 +508,7 @@ int main(void) {
+             SIZE_MAX, SIZE_MAX); // no forcing expected (natural end)
+     }
+ 
++    test_closed_prefill_cancels_forced_message();
+     test_reasoning_budget_clone_mid_counting();
+     test_reasoning_budget_clone_mid_forcing();
+     test_reasoning_budget_force_manual();
+diff --git a/tests/test-server-prompt-cache.cpp b/tests/test-server-prompt-cache.cpp
+index 9e21ed3c3..0c7809a2d 100644
+--- a/tests/test-server-prompt-cache.cpp
++++ b/tests/test-server-prompt-cache.cpp
+@@ -4925,6 +4925,13 @@ void test_checkpoint_capacity_skips_pinned_member() {
+         context, -99, nullptr, victim, refusal));
+     CHECK(refusal ==
+           common_cache_plan_destruction_reason::mandatory_anchor);
++    // Same membership, new request: the former task's checkpoint is no longer
++    // mandatory. A ring-only refusal latch used to disable replacement forever.
++    CHECK(attempts.request_changed(-98));
++    CHECK(server_cache_checkpoint_capacity_floor(
++        context, -98, nullptr, victim, refusal));
++    CHECK(victim == ring.begin());
++    CHECK(!attempts.request_changed(-98));
+     std::printf(
+         "CACHE_TWO_COPIES capacity_pinned_member PASS members=%zu pinned=%d\n",
+         ring.size(), authority.retention.recovery_pinned(pinned_key) ? 1 : 0);
+@@ -5030,6 +5037,41 @@ void test_checkpoint_capacity_preserves_history() {
+     }
+ }
+ 
++void test_checkpoint_incoming_anchor_coverage() {
++    common_retention_turn_table turns;
++    turns.source = common_retention_source_state::known;
++    turns.token_count = 500;
++    turns.boundaries = { { 0, 0, 50 }, { 1, 100, 200 }, { 2, 300, 400 } };
++    CHECK(turns.valid());
++    const auto checkpoint = [](int64_t tokens) {
++        common_prompt_checkpoint result;
++        result.n_tokens = tokens;
++        auto & frontier = result.computation_frontier;
++        frontier.version = common_computation_frontier::VERSION;
++        frontier.sequence_epoch = 1;
++        frontier.token_count = tokens;
++        frontier.next_position = tokens;
++        frontier.execution_identity = "execution";
++        frontier.adapter_config_identity = "adapter";
++        frontier.media_content_identity = "media";
++        return result;
++    };
++    const auto incoming = checkpoint(480);
++    CHECK(server_cache_checkpoint_anchor_covered(checkpoint(350), incoming, turns, false));
++    CHECK(server_cache_checkpoint_anchor_covered(checkpoint(160), incoming, turns, false));
++    CHECK(!server_cache_checkpoint_anchor_covered(checkpoint(350), incoming, turns, true));
++    CHECK(!server_cache_checkpoint_anchor_covered(checkpoint(50), incoming, turns, false));
++    CHECK(!server_cache_checkpoint_anchor_covered(checkpoint(490), incoming, turns, false));
++    auto other = checkpoint(350);
++    other.computation_frontier.sequence_epoch++;
++    CHECK(!server_cache_checkpoint_anchor_covered(other, incoming, turns, false));
++    other = checkpoint(350);
++    other.computation_frontier.execution_identity = "different execution";
++    CHECK(!server_cache_checkpoint_anchor_covered(other, incoming, turns, false));
++    turns.source = common_retention_source_state::unavailable;
++    CHECK(!server_cache_checkpoint_anchor_covered(checkpoint(350), incoming, turns, false));
++}
++
+ void test_checkpoint_attempt_latch_rearms_on_ring_change() {
+     server_cache_checkpoint_attempt_latch latch;
+     uint64_t full_computations = 0;
+@@ -5056,7 +5098,7 @@ void test_checkpoint_attempt_latch_rearms_on_ring_change() {
+     CHECK(!latch.begin(
+         server_cache_checkpoint_attempt_lane::capacity_floor));
+ 
+-    // A committed member erase/publication is the only re-arm: computation
++    // A committed member erase/publication re-arms computation
+     // and evidence both become observable again for the new ring.
+     latch.ring_changed();
+     if (latch.begin(
+@@ -5070,6 +5112,12 @@ void test_checkpoint_attempt_latch_rearms_on_ring_change() {
+     CHECK(full_computations == 2);
+     CHECK(receipts == 2);
+     CHECK(latch.begin(server_cache_checkpoint_attempt_lane::capacity_floor));
++    CHECK(latch.request_changed(100));
++    CHECK(latch.begin(server_cache_checkpoint_attempt_lane::capacity_floor));
++    CHECK(!latch.request_changed(100));
++    CHECK(!latch.begin(server_cache_checkpoint_attempt_lane::capacity_floor));
++    CHECK(latch.request_changed(101));
++    CHECK(latch.begin(server_cache_checkpoint_attempt_lane::capacity_floor));
+ }
+ 
+ void test_checkpoint_effect_matrix_consistency() {
+@@ -5546,6 +5594,7 @@ int main(int argc, char ** argv) {
+     test_checkpoint_capacity_floor();
+     test_checkpoint_capacity_preserves_history();
+     test_checkpoint_attempt_latch_rearms_on_ring_change();
++    test_checkpoint_incoming_anchor_coverage();
+     test_checkpoint_effect_matrix_consistency();
+     test_live_checkpoint_payload_ownership();
+     test_live_checkpoint_batch_admission();
+diff --git a/tests/test-server-resume-store.cpp b/tests/test-server-resume-store.cpp
+index 97def8c5e..240406ca1 100644
+--- a/tests/test-server-resume-store.cpp
++++ b/tests/test-server-resume-store.cpp
+@@ -939,10 +939,59 @@ static void test_shared_positions() {
+     CHECK(!server_resume_manifest_validate(manifest, error));
+ }
+ 
++static void test_disk_budget(const std::string & root) {
++    server_resume_reason reason;
++    std::string error;
++    auto store = server_resume_store::open(root, FAMILY, reason, error);
++    CHECK(store != nullptr);
++    if (!store) { return; }
++    const auto bytes = [](const std::string & path) {
++        uint64_t total = 0;
++        for (const auto & file : fs::recursive_directory_iterator(path)) {
++            if (fs::is_regular_file(file.symlink_status())) { total += file.file_size(); }
++        }
++        return total;
++    };
++    const std::string older = server_resume_store::new_entry_id();
++    const std::string newer = server_resume_store::new_entry_id();
++    auto old = manifest_of(16, 0);
++    auto fresh = manifest_of(16, 0);
++    old.last_used_unix_ms = 100;
++    fresh.last_used_unix_ms = 200;
++    CHECK(add_generation(*store, older, old, 0, 16) == server_resume_reason::ok);
++    CHECK(add_generation(*store, newer, fresh, 0, 16) == server_resume_reason::ok);
++    // External Pi snapshots count against the same budget, but only the native
++    // writer's own entries are removable. The newest entry can be protected.
++    const std::string external = root + "/pi-snapshot.bin";
++    { std::ofstream out(external); out << std::string(512, 'x'); }
++    const uint64_t cap = bytes(root) - bytes(store->directory() + "/entries/" + older) + 64;
++    store->set_budget(root, cap);
++    CHECK(store->make_room(64, {newer}));
++    CHECK(!fs::exists(store->directory() + "/entries/" + older));
++    CHECK(fs::exists(store->directory() + "/entries/" + newer));
++    CHECK(fs::exists(external));
++    CHECK(store->free_bytes() == 64);
++    CHECK(!store->make_room(cap + 1)); // an impossible save does not evict useful entries
++    CHECK(fs::exists(store->directory() + "/entries/" + newer));
++    store->set_budget(root, 256);
++    CHECK(!store->make_room(0, {newer}));
++    CHECK(fs::exists(external));
++    CHECK(store->free_bytes() == 0);
++    CHECK(!store->make_room(0)); // external file alone is over budget
++    CHECK(!fs::exists(store->directory() + "/entries/" + newer));
++    store->set_budget(root, 0);
++    CHECK(store->free_bytes() > 0);
++}
++
+ int main() {
+     test_shared_positions();
+     test_manifest_round_trip();
+     test_manifest_refusals();
++    {
++        const std::string root = (fs::temp_directory_path() / ("test-server-resume-budget-" + server_resume_store::new_entry_id())).string();
++        test_disk_budget(root);
++        fs::remove_all(root);
++    }
+ 
+     {
+         const std::string root = (fs::temp_directory_path() / ("test-server-resume-entry-" + server_resume_store::new_entry_id())).string();
+diff --git a/tools/server/server-cache-authority.cpp b/tools/server/server-cache-authority.cpp
+index aede28c9c..964ea052d 100644
+--- a/tools/server/server-cache-authority.cpp
++++ b/tools/server/server-cache-authority.cpp
+@@ -215,6 +215,24 @@ bool execute_shared_payload_claims(
+ 
+ } // namespace
+ 
++bool server_cache_checkpoint_anchor_covered(
++        const common_prompt_checkpoint & previous,
++        const common_prompt_checkpoint & incoming,
++        const common_retention_turn_table & turns,
++        bool earliest) noexcept {
++    if (earliest || !server_cache_checkpoint_bounded_replay(
++            previous, incoming, UINT64_MAX)) {
++        return false;
++    }
++    common_retention_stamp old_score, new_score;
++    if (!common_retention_score(turns, uint64_t(previous.n_tokens), old_score) ||
++        !common_retention_score(turns, uint64_t(incoming.n_tokens), new_score)) {
++        return false;
++    }
++    return !old_score.mandatory_anchor ||
++           old_score.mapped_turn_ordinal == new_score.mapped_turn_ordinal;
++}
++
+ bool server_cache_checkpoint_publication_redundant(
+         const std::list<common_prompt_checkpoint> & checkpoints,
+         const common_prompt_checkpoint & incoming,
+diff --git a/tools/server/server-cache-authority.h b/tools/server/server-cache-authority.h
+index 5ac90fa10..4a1ff2424 100644
+--- a/tools/server/server-cache-authority.h
++++ b/tools/server/server-cache-authority.h
+@@ -87,6 +87,16 @@ enum class server_cache_checkpoint_attempt_lane : uint8_t {
+ 
+ class server_cache_checkpoint_attempt_latch {
+ public:
++    bool request_changed(int task_id) noexcept {
++        if (has_task_id_ && task_id_ == task_id) {
++            return false;
++        }
++        has_task_id_ = true;
++        task_id_ = task_id;
++        ring_changed();
++        return true;
++    }
++
+     bool begin(server_cache_checkpoint_attempt_lane lane) noexcept {
+         const size_t index = size_t(lane);
+         if (index >= attempted_generation_.size() ||
+@@ -124,6 +134,8 @@ public:
+     }
+ 
+ private:
++    bool has_task_id_ = false;
++    int task_id_ = 0;
+     uint64_t generation_ = 1;
+     std::array<uint64_t,
+         size_t(server_cache_checkpoint_attempt_lane::_count)>
+@@ -184,7 +196,17 @@ bool server_cache_checkpoint_capacity_floor(
+     int checkpoint_task_id,
+     const common_prompt_checkpoint * seam_heuristic,
+     server_cache_checkpoint_authority_context::checkpoint_iterator & victim,
+-    common_cache_plan_destruction_reason & refusal) noexcept;
++    common_cache_plan_destruction_reason & refusal,
++    const common_prompt_checkpoint * incoming = nullptr) noexcept;
++
++// Keep the earliest recovery point. A fully admitted incoming checkpoint can
++// replace another representative of the same mandatory turn bucket only when
++// the current request geometry and common execution lineage prove coverage.
++bool server_cache_checkpoint_anchor_covered(
++    const common_prompt_checkpoint & previous,
++    const common_prompt_checkpoint & incoming,
++    const common_retention_turn_table & turns,
++    bool earliest) noexcept;
+ 
+ void server_cache_checkpoint_publication_skipped(
+     server_cache_checkpoint_authority_context & context,
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index dcd897142..460fb8b89 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2401,10 +2401,11 @@ struct server_slot {
+             int checkpoint_task_id,
+             const common_prompt_checkpoint * seam_heuristic,
+             checkpoint_iterator & victim,
+-            common_cache_plan_destruction_reason & refusal) noexcept {
++            common_cache_plan_destruction_reason & refusal,
++            const common_prompt_checkpoint * incoming = nullptr) noexcept {
+         auto context = checkpoint_authority_context();
+         return server_cache_checkpoint_capacity_floor(
+-            context, checkpoint_task_id, seam_heuristic, victim, refusal);
++            context, checkpoint_task_id, seam_heuristic, victim, refusal, incoming);
+     }
+ 
+     void checkpoint_publication_skipped(
+@@ -3186,6 +3187,16 @@ struct server_slot {
+         if (!resume_status.is_null()) {
+             res["resume"] = resume_status;
+         }
++        if (!is_processing() && !prompt.tokens.has_media()) {
++            std::array<uint8_t, 32> digest = {};
++            if (prompt.tokens.retention_token_digest(digest)) {
++                res["cache_identity"] = {
++                    {"tokens", prompt.n_tokens()},
++                    {"digest", server_resume_hex(digest.data(), digest.size())},
++                    {"epoch", prompt.sequence_epoch},
++                };
++            }
++        }
+ 
+         // live effective KV bits/value (moves under dynamic VBR); pollable via GET /slots
+         if (ctx_tgt != nullptr) {
+@@ -3866,6 +3877,14 @@ private:
+             uint64_t(params_base.cache_ram_mib)*1024ull*1024ull;
+         return std::min(configured, VBR_AUTOMATIC_EXACT_CAPTURE_MAX_BYTES);
+     }
++    uint64_t checkpoint_capture_max_bytes() const noexcept {
++        if (params_base.checkpoint_max_mib < 0) {
++            return vbr_automatic_exact_capture_max_bytes();
++        }
++        return std::min<uint64_t>(
++            uint64_t(params_base.checkpoint_max_mib)*1024ull*1024ull,
++            VBR_AUTOMATIC_EXACT_CAPTURE_MAX_BYTES);
++    }
+     struct vbr_idle_exact_capture_work {
+         server_queue::idle_capture_session session;
+         server_vbr_explicit_host_capture capture;
+@@ -5113,6 +5132,9 @@ private:
+         if (params_base.resume) {
+             open(resume_store,
+                  params_base.resume_path.empty() ? fs_get_cache_directory() : params_base.resume_path, "resume", true);
++            if (resume_store) {
++                resume_store->set_budget(params_base.resume_budget_path, uint64_t(params_base.resume_max_bytes));
++            }
+         }
+         if (!params_base.slot_save_path.empty()) {
+             // its entries live for one request; the file of a slot is synced on its own
+@@ -5616,6 +5638,14 @@ private:
+     void resume_prune(size_t n_new) {
+         const auto keep = resume_retention(n_new);
+         resume_store->prune(resume_key_hex, keep.n_keep_key, keep.n_keep_total, keep.held, keep.live);
++        if (!resume_store->make_room(0, {}, keep.live)) {
++            SRV_WRN("%s\n", "RESUME event=budget_blocked reason=external_files_exceed_budget");
++        }
++    }
++
++    void resume_budget_make_room(uint64_t required, const std::string & id) {
++        const auto keep = resume_retention(0);
++        (void) resume_store->make_room(required, {id}, keep.live);
+     }
+ 
+     // the conversation of the slot's entry is no longer in the slot. It lives on in the host
+@@ -6058,6 +6088,7 @@ private:
+         if (!have_old) {
+             resume_prune(1);
+         }
++        resume_budget_make_room(bytes_needed, id);
+         if (have_old && (old.chunks.size() > n_kept + 1 || resume_store->free_bytes() < bytes_needed)) {
+             // give up the old commit, keep only what is reused
+             server_resume_manifest kept = old;
+@@ -6075,6 +6106,7 @@ private:
+             resume_store->sweep(id, kept);
+             replaced = true;
+         }
++        resume_budget_make_room(bytes_needed, id);
+         if (resume_store->free_bytes() < bytes_needed) {
+             if (replaced) {
+                 resume_store->remove_entry(id);
+@@ -6169,6 +6201,7 @@ private:
+         }
+         const auto ring = resume_ring_tails(slot, adapter, slot.prompt.n_tokens());
+         if (!have_old) { resume_prune(1); }
++        resume_budget_make_room(size + resume_ring_bytes(ring) + 1024*1024, slot.resume_entry_id);
+         if (resume_store->free_bytes() < size + resume_ring_bytes(ring) + 1024*1024) {
+             return resume_failed(server_resume_reason::no_space, "whole media sequence");
+         }
+@@ -6430,6 +6463,7 @@ private:
+         };
+         const auto ring = resume_ring_tails(slot, adapter, n_tokens);
+         const uint64_t bytes_needed = captured.payload_bytes + captured.companion_bytes + resume_ring_bytes(ring);
++        resume_budget_make_room(bytes_needed, id);
+         if (resume_store->free_bytes() < bytes_needed) {
+             return abandon(server_resume_reason::no_space, "need " + std::to_string(bytes_needed) + " bytes");
+         }
+@@ -6675,6 +6709,7 @@ private:
+             return resume_vbr_abandon(slot, id, reason, message);
+         };
+         const auto ring = resume_ring_tails(slot, adapter, n_tokens);
++        resume_budget_make_room(payload.size() + frontier.size() + resume_ring_bytes(ring) + 1024*1024, id);
+         if (resume_store->free_bytes() < payload.size() + frontier.size() + resume_ring_bytes(ring) + 1024*1024) {
+             return abandon(server_resume_reason::no_space, "placement");
+         }
+@@ -7172,7 +7207,7 @@ private:
+ 
+     // A slot file back into the slot: an entry read where the file lies, installed, and dropped. `bytes`
+     // is the file's size.
+-    json slot_file_restore(server_slot & slot, const std::string & filepath, uint64_t & bytes) {
++    json slot_file_restore(server_slot & slot, const std::string & filepath, uint64_t & bytes, bool prefer_live = false) {
+         resume_slot_file_scope scope(*this, slot);
+         std::string id;
+         std::string error;
+@@ -7181,6 +7216,16 @@ private:
+         if (reason != server_resume_reason::ok) {
+             return resume_failed(reason, error);
+         }
++        if (prefer_live && manifest.resume_key == resume_key_hex && slot.prompt.n_tokens() > 0 &&
++            slot_frontier_is_physically_aligned(slot)) {
++            server_tokens saved;
++            if (!resume_ledger_restore(slot, manifest, lora_config_identity(slot.lora), saved) &&
++                !saved.empty() && slot.prompt.tokens.get_common_prefix(saved) == saved.size()) {
++                resume_drop_entry(id, error);
++                bytes = 0;
++                return {{"outcome", "kept_live"}, {"n_tokens", slot.prompt.n_tokens()}, {"bytes_read", 0}};
++            }
++        }
+         json status = resume_install(slot, id, manifest);
+         resume_drop_entry(id, error);
+         scope.drop_lineage();
+@@ -9601,9 +9646,10 @@ private:
+         }
+ 
+         // measure mmproj memory for auto-fit (upstream #21489)
+-        // Only reserve mmproj space when auto-fit is actively selecting context size.
+-        // When -c is explicit, the fitter doesn't run so there's no need to reserve.
+-        if (has_mmproj && params_base.fit_params && params_base.n_ctx == 0 && !params_base.mmproj_gpu_swap) {
++        // Explicit context still permits automatic layer placement. Account for
++        // the co-resident projector in that fit too; omitting it can consume the
++        // very margin reserved for context-linear dequant scratch at depth.
++        if (has_mmproj && params_base.fit_params && !params_base.mmproj_gpu_swap) {
+             auto mparams_measure = make_mmproj_params(params_base.mmproj_use_gpu);
+             int64_t t_start = ggml_time_us();
+             auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams_measure);
+@@ -14068,6 +14114,15 @@ private:
+             slot.prompt.tokens.size());
+         slot.task = std::move(launched_task);
+ 
++        // The capacity floor protects checkpoints belonging to the current task.
++        // A refusal in that task must not latch forever after its checkpoints
++        // become replaceable in the next request, even with unchanged membership.
++        if (slot.checkpoint_attempts.request_changed(slot.task->id)) {
++            slot.checkpoint_seam_heuristic = nullptr;
++            slot.checkpoint_floor_refusal =
++                common_cache_plan_destruction_reason::mandatory_anchor;
++        }
++
+         if (prepared_host_restore) {
+             server_retention_lineage_ticket restored_source;
+             if (slot.retention_obs->consume_prepared_launch(
+@@ -19091,11 +19146,11 @@ private:
+                             break;
+                         }
+                         uint64_t n_read = 0;
+-                        json status = slot_file_restore(*slot, filepath, n_read);
++                        json status = slot_file_restore(*slot, filepath, n_read, task.slot_action.prefer_live);
+                         const json result = resume_public(status);
+                         status["event"] = "slot_file_restore";
+                         resume_log(status);
+-                        if (!resume_installed(status)) {
++                        if (!resume_installed(status) && status.value("outcome", "") != "kept_live") {
+                             // skipped: the file is not for this server (key, adapter, projector),
+                             // or a dynamic VBR cache holds other conversations it cannot insert beside
+                             std::string reason = status.value("reason", std::string());
+@@ -21007,7 +21062,7 @@ private:
+                                     size_t(slot.task->n_tokens()),
+                                     slot.task->need_sampling(),
+                                     slot.diff_self_spec,
+-                                    slot.frontier_logits_matches());
++                                    can_reuse_live_frontier_logits(slot, *slot.task, size_t(n_past)));
+                             if (exact_prompt_action.use_frontier_logits) {
+                                 slot.frontier_logits.pending = true;
+                                 SLT_INF(slot,
+@@ -21594,7 +21649,7 @@ private:
+                                     slot.get_spec())
+                                 : 0;
+                             const uint64_t exact_capture_limit =
+-                                vbr_automatic_exact_capture_max_bytes();
++                                checkpoint_capture_max_bytes();
+                             const bool qsa_vbr_fits = qsa_size_ready &&
+                                 uint64_t(checkpoint_size) <=
+                                     exact_capture_limit &&
+@@ -21625,6 +21680,12 @@ private:
+                             } else if (checkpoint_size == 0) {
+                                 SLT_ERR(slot, "%s", "skipping context checkpoint: target state size is zero\n");
+                                 staged.clear();
++                            } else if (params_base.checkpoint_max_mib >= 0 &&
++                                       uint64_t(checkpoint_size) > exact_capture_limit) {
++                                SLT_DBG(slot,
++                                    "skipping context checkpoint: target=%zu exceeds capture limit=%" PRIu64 "\n",
++                                    checkpoint_size, exact_capture_limit);
++                                staged.clear();
+                             } else {
+                                 size_t n = 0;
+                                 next.data_tgt.overwrite(
+@@ -21953,7 +22014,7 @@ private:
+                                 if (!slot.checkpoint_capacity_floor(
+                                         ckpt_id_task,
+                                         seam_heuristic_checkpoint,
+-                                        victim, refusal)) {
++                                        victim, refusal, &staged.back())) {
+                                     slot.checkpoint_publication_skipped(refusal);
+                                     checkpoint_publication_allowed = false;
+                                     break;
+@@ -22350,7 +22411,7 @@ private:
+                 if (n_batch == 1 && ret == 1) {
+                     // TODO: try to terminate only the largest active slot/sequence and continue with the rest
+                     //       need to remove the tokens from the current batch too
+-                    err = "Context size has been exceeded.";
++                    err = "KV allocation failed for a single-token batch (device memory exhausted or no free cache slot); this is not a measured token context overflow.";
+                 }
+ 
+                 if (ret == -1) {
+@@ -22372,12 +22433,12 @@ private:
+                     for (auto & slot : slots) {
+                         if (slot.is_processing()) {
+                             send_error(slot, err);
+-                            slot.release();
+ 
+                             // note: it's complicated to keep track of how much of the current batch has been
+                             //       processed before the error occurred, so we simply clear the entire context
+                             slot.mandatory_recovery_reset(
+                                 server_cache_destruction_reason::restore_failure);
++                            slot.release();
+                         }
+                     }
+ 
+@@ -22386,6 +22447,21 @@ private:
+                 }
+             }
+ 
++            // Speculative sampling needs every verification row in one target
++            // decode. Halving a live verification group produces logits from
++            // different decode calls, which post_cycle cannot safely combine.
++            const bool atomic_verification = ret == 1 && std::any_of(slots.begin(), slots.end(),
++                [](const server_slot & slot) { return slot.is_processing() && !slot.spec_i_batch.empty(); });
++            if (atomic_verification) {
++                if (try_clear_idle_slots()) return false;
++                const std::string err = "Device memory exhausted while allocating an atomic speculative verification batch; no draft tokens were accepted. Fit model placement and reserve runtime memory before retrying.";
++                for (auto & slot : slots) if (slot.is_processing()) {
++                    send_error(slot, err);
++                    slot.mandatory_recovery_reset(server_cache_destruction_reason::restore_failure);
++                    slot.release();
++                }
++                throw std::runtime_error(err);
++            }
+             // retry with half the batch size to try to find a free slot in the KV cache
+             GGML_ASSERT(decode_terminal ==
+                 server_speculative_decode_terminal::retry);
+@@ -26842,6 +26918,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const
+         task.slot_action.filename = filename;
+         task.slot_action.filepath = filepath;
+         task.slot_action.resume_entry = resume_entry;
++        task.slot_action.prefer_live = json_value(request_data, "prefer_live", false);
+         rd.post_task(std::move(task));
+     }
+ 
+diff --git a/tools/server/server-resume-store.cpp b/tools/server/server-resume-store.cpp
+index 2fc8cde33..3f938aefc 100644
+--- a/tools/server/server-resume-store.cpp
++++ b/tools/server/server-resume-store.cpp
+@@ -646,6 +646,8 @@ void server_resume_store::remove_entry(const std::string &) const {}
+ std::set<std::string> server_resume_store::victims(const std::string &, size_t, size_t, const std::set<std::string> &, const std::set<std::string> &) const { return {}; }
+ void server_resume_store::prune(const std::string &, size_t, size_t, const std::set<std::string> &, const std::set<std::string> &) const {}
+ uint64_t server_resume_store::free_bytes() const { return 0; }
++void server_resume_store::set_budget(const std::string &, uint64_t) {}
++bool server_resume_store::make_room(uint64_t, const std::set<std::string> &, const std::set<std::string> &) const { return false; }
+ 
+ std::string server_resume_store::keep_value(const std::string &, const std::string &, std::string &) { return {}; }
+ 
+@@ -1518,12 +1520,58 @@ void server_resume_store::prune(
+     }
+ }
+ 
++static uint64_t directory_bytes(const std::string & root) {
++    std::error_code ec;
++    uint64_t bytes = 0;
++    for (fs::recursive_directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
++        // Do not follow symlinks, including a symlink to a regular file outside the cache.
++        if (fs::is_regular_file(it->symlink_status(ec))) {
++            const uint64_t size = it->file_size(ec);
++            if (ec || size > UINT64_MAX - bytes) { return UINT64_MAX; }
++            bytes += size;
++        }
++    }
++    return ec ? UINT64_MAX : bytes;
++}
++
++void server_resume_store::set_budget(const std::string & root, uint64_t max_bytes) {
++    budget_root = root.empty() ? dir : root;
++    budget_bytes = max_bytes;
++}
++
++bool server_resume_store::make_room(uint64_t required, const std::set<std::string> & protected_ids,
++                                   const std::set<std::string> & preferred_ids) const {
++    if (!budget_bytes) { return true; }
++    // An unreadable budget root is not evidence that any entry should be evicted.
++    if (directory_bytes(budget_root) == UINT64_MAX) { return false; }
++    const auto fits = [&]() {
++        const uint64_t used = directory_bytes(budget_root);
++        return used <= budget_bytes && required <= budget_bytes - used;
++    };
++    if (required > budget_bytes) { return false; }
++    if (fits()) { return true; }
++    auto entries = list(); // newest first
++    std::reverse(entries.begin(), entries.end());
++    std::stable_sort(entries.begin(), entries.end(), [&](const server_resume_entry & a, const server_resume_entry & b) {
++        return preferred_ids.count(a.id) < preferred_ids.count(b.id);
++    });
++    for (const auto & entry : entries) {
++        if (protected_ids.count(entry.id)) { continue; }
++        remove_entry(entry.id);
++        if (fits()) { return true; }
++    }
++    return false;
++}
++
+ uint64_t server_resume_store::free_bytes() const {
+     struct statvfs vfs;
+     if (statvfs(dir.c_str(), &vfs) != 0) {
+         return 0;
+     }
+-    return (uint64_t) vfs.f_bavail * vfs.f_frsize;
++    const uint64_t available = (uint64_t) vfs.f_bavail * vfs.f_frsize;
++    if (!budget_bytes) { return available; }
++    const uint64_t used = directory_bytes(budget_root);
++    return std::min(available, used >= budget_bytes ? uint64_t(0) : budget_bytes - used);
+ }
+ 
+ std::string server_resume_store::keep_value(const std::string & name, const std::string & fresh, std::string & error) {
+diff --git a/tools/server/server-resume-store.h b/tools/server/server-resume-store.h
+index 8a93362df..9627f44da 100644
+--- a/tools/server/server-resume-store.h
++++ b/tools/server/server-resume-store.h
+@@ -257,6 +257,10 @@ public:
+             const std::set<std::string> & held = {}, const std::set<std::string> & live = {}) const;
+ 
+     uint64_t free_bytes() const;
++    void set_budget(const std::string & root, uint64_t max_bytes);
++    // Only this writer's entries are evicted; external files count but are never deleted here.
++    bool make_room(uint64_t required, const std::set<std::string> & protected_ids = {},
++                   const std::set<std::string> & preferred_ids = {}) const;
+ 
+     // One committed entry as a single file, its manifest and then its objects as the store holds
+     // them, and back into a new entry of this store. The file is replaced whole or not at all. A
+@@ -288,6 +292,8 @@ private:
+     std::string dir; // the family namespace
+     int lock_fd = -1;
+     bool durable = true;
++    std::string budget_root;
++    uint64_t budget_bytes = 0;
+ 
+     // imported entry files, by entry id; export_taken() does not look at them
+     struct mounted_entry;
+diff --git a/tools/server/server-retention-sidecar.cpp b/tools/server/server-retention-sidecar.cpp
+index 5df7ca51d..d2b462872 100644
+--- a/tools/server/server-retention-sidecar.cpp
++++ b/tools/server/server-retention-sidecar.cpp
+@@ -2846,6 +2846,7 @@ bool server_retention_sidecar_store::checkpoint_inventory(
+     out.artifact_id = association->second;
+     out.pool = item->second.record.stamp.pool;
+     out.stable_id = item->second.record.stamp.stable_id;
++    out.turns = item->second.record.turns;
+     out.mandatory_anchor = item->second.record.stamp.mandatory_anchor;
+     out.release_owned = !item->second.release_ops.empty();
+     out.recovery_pinned = item->second.recovery_pins != 0;
+diff --git a/tools/server/server-retention-sidecar.h b/tools/server/server-retention-sidecar.h
+index 063c79b13..d4dd37e7c 100644
+--- a/tools/server/server-retention-sidecar.h
++++ b/tools/server/server-retention-sidecar.h
+@@ -193,6 +193,7 @@ struct server_retention_checkpoint_inventory {
+     llama_cache_acct_artifact_id artifact_id;
+     common_retention_pool pool = common_retention_pool::attention;
+     uint64_t stable_id = 0;
++    std::shared_ptr<const common_retention_turn_table> turns;
+     bool mandatory_anchor = false;
+     bool release_owned = false;
+     bool recovery_pinned = false;
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index b4f9b80f8..700504979 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -195,6 +195,7 @@ common_chat_msg task_result_state::update_chat_msg(
+         bool filter_tool_calls) {
+     generated_text += text_added;
+     auto msg_prv_copy = chat_msg;
++    const bool commit_tools_at_eof = chat_parser_params.format == COMMON_CHAT_FORMAT_PEG_NATIVE;
+     //SRV_DBG("Parsing chat message: %s\n", generated_text.c_str());
+     common_chat_msg new_msg;
+     try {
+@@ -203,6 +204,18 @@ common_chat_msg task_result_state::update_chat_msg(
+             is_partial,
+             chat_parser_params);
+     } catch (const std::exception & e) {
++        if (commit_tools_at_eof) {
++            // A partial PEG tree is speculative. Wait for more tokens without
++            // retracting any published prefix or exposing a half parsed tool.
++            if (is_partial) {
++                return chat_msg;
++            }
++            SRV_WRN("chat tool parse failed (%s); no tool call published\n", e.what());
++            chat_msg = msg_prv_copy;
++            chat_msg.content += "\nThe generated tool request was malformed and was not executed. Issue a complete request using the declared tool format.\n";
++            diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
++            return chat_msg;
++        }
+         // A parse failure of a malformed generation must never take down the caller: the PEG
+         // parser throws on a FINAL parse it cannot match (and on a partial parse that fails at
+         // position 0), which aborted llama-cli on an uncaught exception and would fail a fully
+@@ -217,6 +230,22 @@ common_chat_msg task_result_state::update_chat_msg(
+         return chat_msg;
+     }
+     if (!new_msg.empty()) {
++        if (commit_tools_at_eof) {
++            // Incremental PEG backtracking may erase or rewrite an incomplete
++            // call. SSE cannot retract arguments, so publish genuine calls
++            // atomically only after the final parse. Text/thinking still stream.
++            if (is_partial) {
++                new_msg.tool_calls.clear();
++            }
++            const bool content_prefix = new_msg.content.compare(0, msg_prv_copy.content.size(), msg_prv_copy.content) == 0;
++            const bool reasoning_prefix = new_msg.reasoning_content.compare(0, msg_prv_copy.reasoning_content.size(), msg_prv_copy.reasoning_content) == 0;
++            if (is_partial && (!content_prefix || !reasoning_prefix)) {
++                return chat_msg;
++            }
++            // A final parser normalization cannot rewrite bytes already sent.
++            if (!content_prefix) new_msg.content = msg_prv_copy.content;
++            if (!reasoning_prefix) new_msg.reasoning_content = msg_prv_copy.reasoning_content;
++        }
+         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
+         chat_msg = new_msg;
+         auto all_diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
+@@ -4635,7 +4664,8 @@ bool server_cache_checkpoint_capacity_floor(
+         int checkpoint_task_id,
+         const common_prompt_checkpoint * seam_heuristic,
+         server_cache_checkpoint_iterator & victim,
+-        common_cache_plan_destruction_reason & refusal) noexcept {
++        common_cache_plan_destruction_reason & refusal,
++        const common_prompt_checkpoint * incoming) noexcept {
+     victim = context.checkpoints.end();
+     refusal = context.floor_refusal;
+     if (!context.attempts.begin(
+@@ -4648,6 +4678,11 @@ bool server_cache_checkpoint_capacity_floor(
+     }
+     std::vector<server_cache_checkpoint_floor_input> inputs;
+     std::vector<server_cache_checkpoint_iterator> members;
++    server_retention_checkpoint_inventory incoming_catalog;
++    const bool incoming_known = incoming && context.retention &&
++        context.retention->checkpoint_inventory(
++            server_retention_instance_key::for_checkpoint(context.slot_id, incoming),
++            incoming_catalog) && incoming_catalog.turns;
+     try {
+         inputs.reserve(context.checkpoints.size());
+         members.reserve(context.checkpoints.size());
+@@ -4673,7 +4708,10 @@ bool server_cache_checkpoint_capacity_floor(
+                     server_cache_checkpoint_protection::seam_heuristic;
+             }
+             if (catalog_found) {
+-                if (catalog.mandatory_anchor) {
++                const bool covered = incoming_known && catalog.pool == incoming_catalog.pool &&
++                    server_cache_checkpoint_anchor_covered(
++                        *it, *incoming, *incoming_catalog.turns, it == context.checkpoints.begin());
++                if (catalog.mandatory_anchor && !covered) {
+                     input.protection =
+                         server_cache_checkpoint_protection::
+                             mandatory_anchor;
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 2d8a43b53..6274177b8 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -215,6 +215,7 @@ struct server_task {
+         std::string filepath;
+         std::string resume_entry; // restore from the resume store instead of a file
+         bool legacy = false;      // save the one-state file of upstream, not an entry
++        bool prefer_live = false; // keep a live sequence that already extends this snapshot
+     };
+     slot_action slot_action;
+ 
+-- 
+2.43.0
+

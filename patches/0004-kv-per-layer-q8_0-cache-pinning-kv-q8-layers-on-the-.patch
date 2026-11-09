@@ -1,0 +1,430 @@
+From 43ae75184665e47b1d7fdb79fdb30081af3b4c19 Mon Sep 17 00:00:00 2001
+From: joris-sta <joris-sta@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 21:45:10 +0200
+Subject: [PATCH] kv: per-layer q8_0 cache pinning (--kv-q8-layers) on the
+ fixed-type path
+
+New public option --kv-q8-layers <LIST> (indices or inclusive ranges,
+e.g. 3,7,11-15) pins BOTH K and V of selected zero-based model layers to
+q8_0 while sibling layers keep -ctk/-ctv. Recurrent and sliding-window
+layers are rejected, indices must be existing full-attention layers,
+duplicates deduplicate, and all callers (server, bench, CLI) share one
+strict parser (common_parse_kv_q8_layers). Dynamic VBR is refused on the
+same context so selected layers cannot silently degrade; shared/reused
+cache layers and VBR env overrides also conflict and are rejected at
+init. The public context API gains kv_q8_layers / n_kv_q8_layers and is
+copied at context creation.
+
+Also carried in the params plumbing: --checkpoint-max-mib (per-checkpoint
+capture cap, -1 inherits --cache-ram, 0 disables), --resume-max-mib and
+--resume-budget-path for the persistent resume disk budget, a server fit
+guard that refuses unproven automatic placements when auxiliary models
+cannot fit, and llama-bench's kv choice plumbing for VBR arms.
+---
+ common/arg.cpp                    | 54 +++++++++++++++++++++++++++++++
+ common/arg.h                      |  3 ++
+ common/common.cpp                 |  6 ++++
+ common/common.h                   |  4 +++
+ include/llama.h                   |  2 ++
+ src/llama-context.cpp             |  6 ++++
+ src/llama-kv-cache.cpp            | 15 +++++++++
+ src/llama-memory.h                |  2 ++
+ src/llama-model.cpp               | 10 ++++++
+ tools/cli/cli-context.cpp         | 20 +++++++++---
+ tools/cli/cli-context.h           |  1 +
+ tools/llama-bench/llama-bench.cpp | 12 +++++++
+ 12 files changed, 130 insertions(+), 5 deletions(-)
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 68821faa6..f82a9ceda 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -67,6 +67,30 @@
+ using json = common_json;
+ using namespace common_arg_utils;
+ 
++std::vector<int32_t> common_parse_kv_q8_layers(const std::string & value) {
++    std::vector<int32_t> layers;
++    std::stringstream input(value);
++    std::string part;
++    if (value.empty() || value.back() == ',') throw std::invalid_argument("--kv-q8-layers: empty layer list or entry");
++    while (std::getline(input, part, ',')) {
++        const auto dash = part.find('-');
++        const auto parse = [](const std::string & s) -> int32_t {
++            if (s.empty() || s.find_first_not_of("0123456789") != std::string::npos)
++                throw std::invalid_argument("--kv-q8-layers: expected nonnegative layer index");
++            const unsigned long n = std::stoul(s);
++            if (n > 65535) throw std::invalid_argument("--kv-q8-layers: layer index exceeds 65535");
++            return int32_t(n);
++        };
++        const int32_t first = parse(part.substr(0, dash));
++        const int32_t last = dash == std::string::npos ? first : parse(part.substr(dash + 1));
++        if (last < first) throw std::invalid_argument("--kv-q8-layers: descending range");
++        for (int32_t il = first; il <= last; ++il) layers.push_back(il);
++    }
++    std::sort(layers.begin(), layers.end());
++    layers.erase(std::unique(layers.begin(), layers.end()), layers.end());
++    return layers;
++}
++
+ static std::initializer_list<enum llama_example> mmproj_examples = {
+     LLAMA_EXAMPLE_MTMD,
+     LLAMA_EXAMPLE_SERVER,
+@@ -2562,6 +2586,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.checkpoint_min_step = value;
+         }
+     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
++        {"--checkpoint-max-mib"}, "N",
++        "maximum automatic context checkpoint capture in MiB (-1: inherit --cache-ram, 0: disable capture); independent of the host prompt-cache budget",
++        [](common_params & params, int value) {
++            if (value < -1) {
++                throw std::invalid_argument("checkpoint-max-mib must be -1 or non-negative");
++            }
++            params.checkpoint_max_mib = value;
++        }
++    ).set_env("LLAMA_ARG_CHECKPOINT_MAX_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+     add_opt(common_arg(
+         {"-cram", "--cache-ram"}, "N",
+         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
+@@ -3319,6 +3353,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.no_host = true;
+         }
+     ).set_env("LLAMA_ARG_NO_HOST"));
++    add_opt(common_arg(
++        {"--kv-q8-layers"}, "LIST",
++        "keep K/V of selected full-attention layers at q8_0; zero-based model indices, comma-separated indices or inclusive ranges (e.g. 3,7,11-15); recurrent/SWA layers are rejected; fixed cache types only",
++        [](common_params & params, const std::string & value) {
++            params.kv_q8_layers = common_parse_kv_q8_layers(value);
++        }
++    ).set_env("LLAMA_ARG_KV_Q8_LAYERS"));
+     add_opt(common_arg(
+         {"-ct", "--cache-type"}, "TYPE",
+         string_format(
+@@ -4784,6 +4825,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.resume_path = value;
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_RESUME_PATH"));
++    add_opt(common_arg(
++        {"--resume-max-mib"}, "N",
++        "disk budget for persistent resume in MiB (0: unlimited); includes --resume-budget-path when supplied",
++        [](common_params & params, int value) {
++            if (value < 0) { throw std::invalid_argument("resume-max-mib must be nonnegative"); }
++            params.resume_max_bytes = int64_t(value)*1024*1024;
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
++        {"--resume-budget-path"}, "PATH",
++        "account for all regular files under this directory in the persistent resume disk budget",
++        [](common_params & params, const std::string & value) { params.resume_budget_path = value; }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+     add_opt(common_arg(
+         {"--cache-receipt"},
+         "attach a cache receipt (keyed chained block-hash divergence hint) to responses (default: disabled)",
+diff --git a/common/arg.h b/common/arg.h
+index 1b6f0aed7..58825fb4d 100644
+--- a/common/arg.h
++++ b/common/arg.h
+@@ -158,3 +158,6 @@ void common_models_handler_apply(common_models_handler & handler, common_params
+ 
+ // initialize argument parser context - used by test-arg-parser and preset
+ common_params_context common_params_parser_init(common_params & params, llama_example ex, void(*print_usage)(int, char **) = nullptr);
++
++// Shared strict parser for server/CLI/bench fixed per-layer Q8 policy.
++std::vector<int32_t> common_parse_kv_q8_layers(const std::string & value);
+diff --git a/common/common.cpp b/common/common.cpp
+index 3061389f2..8d331b21c 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1558,6 +1558,10 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+                 throw std::runtime_error(
+                     "failed to fit parameters to device memory (hard error); retry with -fit off");
+             }
++            if (params.n_ctx > 0 && params.n_gpu_layers == -1) {
++                throw std::runtime_error(
++                    "automatic device placement could not fit the requested context and required auxiliary models; refusing to load an unproven placement");
++            }
+         } else {
+             // surface the RESOLVED placement: auto-fit decided the real offload count in
+             // mparams, and callers (e.g. the cache-plan calibration profile) must key on the
+@@ -2099,6 +2103,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     cparams.no_fused_gdn      = params.no_fused_gdn;
+     cparams.logits_all        = params.logits_all;
+ 
++    cparams.kv_q8_layers = params.kv_q8_layers.data();
++    cparams.n_kv_q8_layers = params.kv_q8_layers.size();
+     cparams.type_k = params.cache_type_k;
+     cparams.type_v = params.cache_type_v;
+     cparams.vbr_min_bits          = params.vbr_min_bits_value;
+diff --git a/common/common.h b/common/common.h
+index f4890bde5..01bb8d7dc 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -735,6 +735,7 @@ struct common_params {
+ 
+     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
+     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
++    std::vector<int32_t> kv_q8_layers; // pin selected full-attention layers to Q8_0 K/V
+     bool cache_type_k_explicit = false;      // whether -ct/-ctk explicitly selected the K type
+     bool cache_type_v_explicit = false;      // whether -ct/-ctv explicitly selected the V type
+     std::string vbr_budget = "dynamic"; // VBR target budget: dynamic or a fixed tier/bit width
+@@ -868,6 +869,7 @@ struct common_params {
+     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
+     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
+     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
++    int32_t checkpoint_max_mib  = -1;    // per-checkpoint capture cap; -1 inherits cache_ram_mib
+     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+ 
+     std::string hostname      = "127.0.0.1";
+@@ -950,6 +952,8 @@ struct common_params {
+     std::string slot_save_path;
+     bool        resume = false; // save the slots' conversations at shutdown and sleep, restore them at startup and wake
+     std::string resume_path;    // root of the resume store, empty: the cache directory
++    int64_t     resume_max_bytes = 0; // retained disk budget, 0: unlimited
++    std::string resume_budget_path;   // include other caches in this directory in the budget
+     std::string media_path; // path to directory for loading media files
+ 
+     // Cache receipt: untrusted divergence-location hint
+diff --git a/include/llama.h b/include/llama.h
+index c0d5724da..ef2f264fe 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -421,6 +421,8 @@ extern "C" {
+ 
+         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
+         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
++        const int32_t * kv_q8_layers; // zero-based full-attention model-layer indices; copied at context creation
++        size_t n_kv_q8_layers;
+         enum llama_vbr_codec vbr_codec; // representation ladder used by dynamic VBR [EXPERIMENTAL]
+         double vbr_min_bits;              // aggregate KV floor in effective bits/value, 0 = bottom-tier floor; not a per-codec ban
+         uint64_t vbr_vram_budget_bytes;   // mapped-physical KV VRAM budget in bytes, 0 = floor-layout-cost fallback
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 56e0da04e..f40e51d4f 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -612,6 +612,10 @@ llama_context::llama_context(
+             },
+         };
+ 
++        if (params.n_kv_q8_layers) {
++            if (!params.kv_q8_layers) throw std::runtime_error("kv_q8_layers is null with a nonzero count");
++            params_mem.kv_q8_layers.assign(params.kv_q8_layers, params.kv_q8_layers + params.n_kv_q8_layers);
++        }
+         memory.reset(model.create_memory(params_mem, cparams));
+         // Arm immediately after create_memory returns: if any later constructor step throws,
+         // this member is destroyed before `backends` and unregisters their raw handles safely.
+@@ -7375,6 +7379,8 @@ llama_context_params llama_context_default_params() {
+         /*.cb_eval_user_data           =*/ nullptr,
+         /*.type_k                      =*/ GGML_TYPE_F16,
+         /*.type_v                      =*/ GGML_TYPE_F16,
++        /*.kv_q8_layers                 =*/ nullptr,
++        /*.n_kv_q8_layers               =*/ 0,
+         /*.vbr_codec                   =*/ LLAMA_VBR_CODEC_TURBO,
+         /*.vbr_min_bits                =*/ 0.0,
+         /*.vbr_vram_budget_bytes       =*/ 0,
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 87b276f90..3840f5ec1 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1165,6 +1165,10 @@ llama_kv_cache::llama_kv_cache(
+                 layer_type_k = vbr_layer_policy.k[il];
+                 layer_type_v = vbr_layer_policy.v[il];
+             }
++            if (std::find(vbr.kv_q8_layers.begin(), vbr.kv_q8_layers.end(), int32_t(il)) != vbr.kv_q8_layers.end()) {
++                layer_type_k = layer_type_v = GGML_TYPE_Q8_0;
++                LLAMA_LOG_INFO("%s: --kv-q8-layers layer %u: K=q8_0 V=q8_0\n", __func__, il);
++            }
+             // Turbo types have no CPU vec_dot kernel. A movable dynamic-VBR side also cannot
+             // degrade on the host because host buffers have no VMM pool. Pin only those sides
+             // at q8_0; preserve an explicitly pinned f16/bf16/q8_0 side in a mixed -ct config.
+@@ -1309,6 +1313,17 @@ llama_kv_cache::llama_kv_cache(
+     } else if (const char * m = getenv("VBR_MODE")) {
+         vbr_dynamic_wanted = strcmp(m, "dynamic") == 0;
+     }
++    if (vbr_dynamic_wanted && !vbr.kv_q8_layers.empty()) {
++        throw std::runtime_error("--kv-q8-layers cannot be combined with dynamic VBR environment overrides");
++    }
++    for (int32_t il : vbr.kv_q8_layers) {
++        auto it = map_layer_ids.find(il);
++        if (it != map_layer_ids.end()) {
++            const auto & layer = layers[it->second];
++            if (!layer.k || !layer.v || layer.k->type != GGML_TYPE_Q8_0 || layer.v->type != GGML_TYPE_Q8_0)
++                throw std::runtime_error("--kv-q8-layers conflicts with a shared/reused cache layer");
++        }
++    }
+     const bool vbr_vmm_wanted = vbr_dynamic_wanted && !hparams.no_alloc &&
+                                 (vbr_layer_policy.enabled || needs_turbo_layout || vbr_params_.dynamic) &&
+                                 n_stream == 1 && !v_trans;
+diff --git a/src/llama-memory.h b/src/llama-memory.h
+index 2169f5e96..86de88fce 100644
+--- a/src/llama-memory.h
++++ b/src/llama-memory.h
+@@ -110,6 +110,7 @@ struct llama_memory_params {
+     // Resolve a simple KV buffer type to this llama_context's main compute backend instance.
+     // VBR uses the exact instance to reserve backend-context-owned flash-attention scratch.
+     std::function<ggml_backend_t(ggml_backend_buffer_type_t)> compute_backend_for_buft;
++    std::vector<int32_t> kv_q8_layers;
+ };
+ 
+ // TurboQuant dynamic-VBR runtime parameters, threaded from llama_context_params through
+@@ -140,6 +141,7 @@ struct llama_memory_vbr_params {
+     const char * trace_label = nullptr;
+ 
+     std::function<ggml_backend_t(ggml_backend_buffer_type_t)> compute_backend_for_buft;
++    std::vector<int32_t> kv_q8_layers;
+ };
+ 
+ // Resolve the developer environment override with the same precedence for standalone and
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 9d1ea26ab..86ccaa037 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -3054,6 +3054,15 @@ bool llama_model::supports_turbo_vbr() const {
+ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
+     llama_memory_i * res;
+ 
++    if (!params.kv_q8_layers.empty()) {
++        if (cparams.vbr_dynamic) throw std::runtime_error("--kv-q8-layers requires fixed cache types (not dynamic VBR)");
++        for (int32_t il : params.kv_q8_layers) {
++            if (il < 0 || uint32_t(il) >= hparams.n_layer() || hparams.is_recr(il) ||
++                hparams.is_swa(il) || hparams.n_head_kv(il) == 0) {
++                throw std::runtime_error("--kv-q8-layers: layer " + std::to_string(il) + " is not a full-attention model layer");
++            }
++        }
++    }
+     // Allocation padding is independent of the cache's model-scoped attention
+     // read padding, so small contexts remain valid under tensor splitting.
+     const uint32_t attn_n_pad = 1;
+@@ -3073,6 +3082,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+         /*.pin_v                 =*/ cparams.vbr_pin_v,
+         /*.trace_label           =*/ nullptr,
+         /*.compute_backend_for_buft =*/ params.compute_backend_for_buft,
++        /*.kv_q8_layers =*/ params.kv_q8_layers,
+     };
+ 
+     switch (arch) {
+diff --git a/tools/cli/cli-context.cpp b/tools/cli/cli-context.cpp
+index dd35c017e..7731eb2da 100644
+--- a/tools/cli/cli-context.cpp
++++ b/tools/cli/cli-context.cpp
+@@ -377,6 +377,7 @@ bool cli_context::generate_completion(generated_content & content_out, cli_timin
+             const auto & t = chunk.at("timings");
+             timings.prompt_per_second    = t.value("prompt_per_second",    0.0);
+             timings.predicted_per_second = t.value("predicted_per_second", 0.0);
++            timings.predicted_n          = t.value("predicted_n",          timings.predicted_n);
+         }
+         if (!chunk.contains("choices") || !chunk.at("choices").is_array() || chunk.at("choices").empty()) {
+             return;
+@@ -655,11 +656,20 @@ int cli_context::run() {
+         }
+ 
+         if (params.show_timings) {
+-            ui::show_info(string_format(
+-                "\n[ Prompt: %.1f t/s | Generation: %.1f t/s ]",
+-                timings.prompt_per_second,
+-                timings.predicted_per_second
+-            ));
++            if (timings.predicted_n >= 0) {
++                ui::show_info(string_format(
++                    "\n[ Prompt: %.1f t/s | Generation: %.1f t/s | Output: %d tokens ]",
++                    timings.prompt_per_second,
++                    timings.predicted_per_second,
++                    timings.predicted_n
++                ));
++            } else {
++                ui::show_info(string_format(
++                    "\n[ Prompt: %.1f t/s | Generation: %.1f t/s ]",
++                    timings.prompt_per_second,
++                    timings.predicted_per_second
++                ));
++            }
+         }
+ 
+         if (params.single_turn) {
+diff --git a/tools/cli/cli-context.h b/tools/cli/cli-context.h
+index 15ce4efee..4f3f897ed 100644
+--- a/tools/cli/cli-context.h
++++ b/tools/cli/cli-context.h
+@@ -14,6 +14,7 @@
+ struct cli_timings {
+     double prompt_per_second    = 0.0;
+     double predicted_per_second = 0.0;
++    int    predicted_n          = -1;
+ };
+ 
+ struct cli_context_impl;
+diff --git a/tools/llama-bench/llama-bench.cpp b/tools/llama-bench/llama-bench.cpp
+index b7c768f42..a1d674cb9 100644
+--- a/tools/llama-bench/llama-bench.cpp
++++ b/tools/llama-bench/llama-bench.cpp
+@@ -491,6 +491,7 @@ struct cmd_params {
+     bool                             moe_cache_profile;
+     output_formats                   output_format;
+     output_formats                   output_format_stderr;
++    std::vector<int32_t>             kv_q8_layers;
+ };
+ 
+ static const cmd_params cmd_params_defaults = {
+@@ -596,6 +597,7 @@ static void print_usage(int /* argc */, char ** argv) {
+     printf("  -d, --n-depth <n>                                 (default: %s)\n", join(cmd_params_defaults.n_depth, ",").c_str());
+     printf("  -b, --batch-size <n>                              (default: %s)\n", join(cmd_params_defaults.n_batch, ",").c_str());
+     printf("  -ub, --ubatch-size <n>                            (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
++    printf("  --kv-q8-layers <LIST>                            pin zero-based full-attention layers to Q8_0 K/V (indices/ranges)\n");
+     printf("  -ctk, --cache-type-k <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, cmd_cache_type_name), ",").c_str());
+     printf("  -ctv, --cache-type-v <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, cmd_cache_type_name), ",").c_str());
+     printf("  --vbr-codec <turbo|classic>                        dynamic VBR codec ladder (default: turbo)\n");
+@@ -822,6 +824,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
+                 }
+                 auto p = parse_int_range(argv[i]);
+                 params.n_ubatch.insert(params.n_ubatch.end(), p.begin(), p.end());
++            } else if (arg == "--kv-q8-layers") {
++                if (++i >= argc) { invalid_param = true; break; }
++                params.kv_q8_layers = common_parse_kv_q8_layers(argv[i]);
+             } else if (arg == "-ctk" || arg == "--cache-type-k") {
+                 if (++i >= argc) {
+                     invalid_param = true;
+@@ -1587,6 +1592,8 @@ struct cmd_params_instance {
+     uint64_t           vbr_budget_bytes;
+     bool               vbr_budget_explicit;
+ 
++    std::vector<int32_t> kv_q8_layers;
++
+     llama_model_params to_llama_mparams() const {
+         llama_model_params mparams = llama_model_default_params();
+ 
+@@ -1657,6 +1664,8 @@ struct cmd_params_instance {
+         llama_context_params cparams = llama_context_default_params();
+ 
+         cparams.n_ctx           = n_prompt + std::max(n_gen + n_depth, n_gen_warmup);
++        cparams.kv_q8_layers = kv_q8_layers.data();
++        cparams.n_kv_q8_layers = kv_q8_layers.size();
+         cparams.n_batch         = n_batch;
+         cparams.n_ubatch        = n_ubatch;
+         cparams.offload_kqv     = !no_kv_offload;
+@@ -1768,6 +1777,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
+                 /* .vbr_budget_bytes      = */ vbr.budget_bytes,
+                 /* .vbr_budget_explicit   = */ vbr.budget_explicit,
+             };
++            instance.kv_q8_layers = params.kv_q8_layers;
+             instances.push_back(instance);
+         }
+ 
+@@ -1818,6 +1828,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
+                 /* .vbr_budget_bytes      = */ vbr.budget_bytes,
+                 /* .vbr_budget_explicit   = */ vbr.budget_explicit,
+             };
++            instance.kv_q8_layers = params.kv_q8_layers;
+             instances.push_back(instance);
+         }
+ 
+@@ -1868,6 +1879,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
+                 /* .vbr_budget_bytes      = */ vbr.budget_bytes,
+                 /* .vbr_budget_explicit   = */ vbr.budget_explicit,
+             };
++            instance.kv_q8_layers = params.kv_q8_layers;
+             instances.push_back(instance);
+         }
+     }
+-- 
+2.43.0
+

@@ -1,0 +1,689 @@
+From a075dfa1f792a1193d03af1e792830010d59d90a Mon Sep 17 00:00:00 2001
+From: joris-sta <joris-sta@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 21:44:55 +0200
+Subject: [PATCH] ptq1: Pascal DP4A matmul kernels and quantize fusion for
+ ternary weights
+
+MMQ: PTQ1_0 (1.75-bit ternary) prefill entries in the sm_61 DP4A config
+lift the shared Q8-SRAM tile path to ternary: each weight block decodes
+once and lands in the existing Q8 shared tile, so every model carrying
+this packing gets the stock DP4A multiply without a bespoke dot kernel.
+Gated by GGML_CUDA_PTQ1_PASCAL_MMQ=auto|off|on (on for cc==610).
+
+GEMV/MMVQ: a dedicated dense PTQ1-only decode path for SM 6.1
+(mmvq-ptq1-pascal.cuh) reuses one quantized Q8 activation row across
+four PTQ1 output rows per block, and fuses quantization with the signed
+FWHT input rotation when the graph provides one; sign vectors and packed
+code are unpacked on the fly. Gated by GGML_CUDA_PTQ1_PASCAL_GEMV,
+auto-selected only for supported dense shapes (single GPU, no MoE,
+ne11<=4, widths-multiple-of-128); unsupported batches, splits and
+fusions keep the established Q8 MMVQ contract. Supported tile geometry
+is centralized in ptq1-pascal-layout.cuh.
+
+Dedicated device test test-ptq1-pascal (cuda test wheel, SKIP on
+non-CUDA) validates the PTQ1 decode, quantize fusion and tile selection
+against reference arithmetic.
+---
+ ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh |  14 +
+ ggml/src/ggml-cuda/mmq.cu                     |  10 +-
+ ggml/src/ggml-cuda/mmvq-ptq1-pascal.cuh       | 269 ++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq.cu                    |  50 +++-
+ ggml/src/ggml-cuda/ptq1-pascal-layout.cuh     |  30 ++
+ ggml/src/ggml-cuda/quantize.cu                |  20 ++
+ tests/CMakeLists.txt                          |  10 +
+ tests/test-ptq1-pascal.cu                     | 144 ++++++++++
+ 8 files changed, 542 insertions(+), 5 deletions(-)
+ create mode 100644 ggml/src/ggml-cuda/mmvq-ptq1-pascal.cuh
+ create mode 100644 ggml/src/ggml-cuda/ptq1-pascal-layout.cuh
+ create mode 100644 tests/test-ptq1-pascal.cu
+
+diff --git a/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh b/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh
+index 70909e364..c7fa05235 100644
+--- a/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh
++++ b/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh
+@@ -95,6 +95,20 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
+     CASE(GGML_TYPE_Q8_0, 256, 2, 64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_Q8_0, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+ 
++    // PTQ1 uses the existing Q8 shared tile after one packed ternary decode.
++    // The same DP4A multiply applies to every model carrying this weight type.
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  24, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++
+ // ---------------------------------------------------------------------------------------------
+ 
+     CASE(GGML_TYPE_Q2_K, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K, MMQ_ITER_K, false, true);
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index 8ed9241c3..5f8c485e1 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -348,7 +348,15 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
+     switch (type) {
+ #if !defined(GGML_USE_HIP)
+         case GGML_TYPE_PTQ1_0:
+-            mmq_supported = turing_mma_available(cc);
++            {
++                static const bool pascal = [] {
++                    const char * value = getenv("GGML_CUDA_PTQ1_PASCAL_MMQ");
++                    if (!value || strcmp(value,"auto") == 0 || strcmp(value,"on") == 0) return true;
++                    if (strcmp(value,"off") == 0) return false;
++                    GGML_ABORT("GGML_CUDA_PTQ1_PASCAL_MMQ must be auto, off or on");
++                }();
++                mmq_supported = turing_mma_available(cc) || (cc == 610 && pascal);
++            }
+             break;
+ #endif
+         case GGML_TYPE_Q1_0:
+diff --git a/ggml/src/ggml-cuda/mmvq-ptq1-pascal.cuh b/ggml/src/ggml-cuda/mmvq-ptq1-pascal.cuh
+new file mode 100644
+index 000000000..2d820ce75
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mmvq-ptq1-pascal.cuh
+@@ -0,0 +1,269 @@
++#pragma once
++#include "ptq1-pascal-layout.cuh"
++#include "unary.cuh"
++#include <cstdlib>
++#include <cstring>
++#include <cstdio>
++#include <initializer_list>
++
++struct ptq1_pascal_fusion {
++    const block_ptq1_0 * gate = nullptr;
++    const float * bias = nullptr;
++    const float * gate_bias = nullptr;
++    ggml_glu_op op = GGML_GLU_OP_SWIGLU;
++    float limit = 0;
++};
++
++// Streaming weights bypass the GP104 texture/L1 cache. Reused activation
++// words and metadata use LDG explicitly; no global -dlcm=ca build flag.
++static __device__ __forceinline__ uint32_t ptq1_pascal_weight(const uint32_t * p) {
++    uint32_t v;
++    asm("ld.global.cg.u32 %0, [%1];" : "=r"(v) : "l"(p));
++    return v;
++}
++
++template<bool Raw, bool Cache>
++static __device__ __forceinline__ float ptq1_pascal_dot(
++        const block_ptq1_0 * w, const uint32_t * a, int pitch, int kb) {
++    int acc[4] = {};
++    const uint32_t * wp = (const uint32_t *) w;
++    uint32_t packed = ptq1_pascal_weight(wp);
++    // Software lookahead: issue the next packed-weight load before the current
++    // word's five multiply/unpack/DP4A steps. Four independent INT32 chains.
++#pragma unroll
++    for (int g = 0; g < 6; ++g) {
++        const uint32_t next = ptq1_pascal_weight(wp + g + 1);
++        uint32_t lo = __byte_perm(packed, 0, 0x4140);
++        uint32_t hi = __byte_perm(packed, 0, 0x4342);
++#pragma unroll
++        for (int t = 0; t < 5; ++t) {
++            const uint32_t wl = lo * 3, wh = hi * 3;
++            lo = wl & 0x00ff00ff; hi = wh & 0x00ff00ff;
++            int trits = __byte_perm(wl, wh, 0x7531);
++            if constexpr (!Raw) trits = __vsub4(trits, 0x01010101);
++            const int e = g < 4 ? t*16 + 4*g : 80 + t*8 + 4*(g-4);
++            const uint32_t * ap = a + (e/4)*pitch + kb;
++            const int q = Cache ? __ldg(ap) : ptq1_pascal_weight(ap);
++            acc[e/32] = ggml_cuda_dp4a(trits, q, acc[e/32]);
++        }
++        packed = next;
++    }
++    uint32_t v = (packed & 255u) | ((packed & 0xff00u) << 8);
++#pragma unroll
++    for (int t = 0; t < 4; t += 2) {
++        const uint32_t w0 = v*3; v = w0 & 0x00ff00ff;
++        const uint32_t w1 = v*3; v = w1 & 0x00ff00ff;
++        int trits = __byte_perm(w0, w1, 0x7531);
++        if constexpr (!Raw) trits = __vsub4(trits, 0x01010101);
++        const uint32_t * ap = a + (30+t/2)*pitch + kb;
++        const int q = Cache ? __ldg(ap) : ptq1_pascal_weight(ap);
++        acc[3] = ggml_cuda_dp4a(trits, q, acc[3]);
++    }
++    float result = 0;
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        const uint32_t * ap = a + (32+j)*pitch + kb;
++        const uint32_t meta = Cache ? __ldg(ap) : ptq1_pascal_weight(ap);
++        if constexpr (Raw) acc[j] -= int(int16_t(meta >> 16));
++        result += __half2float(__ushort_as_half(meta & 65535)) * float(acc[j]);
++    }
++    return __half2float(__ushort_as_half(packed >> 16)) * result;
++}
++
++// Flat distributes the complete (row, K-block) space; warp ownership gives
++// each warp a row and strides lanes through K. Both retain deterministic
++// per-row reduction order independent of CTA geometry and column count.
++template<int Threads, int Rows, bool Flat, bool Raw = true, bool Cache = true>
++__launch_bounds__(Threads, 2)
++static __global__ void mul_mat_vec_ptq1_pascal(const block_ptq1_0 * weights,
++        const uint32_t * activations, float * dst, int kblocks, int rows,
++        int row_stride, int dst_stride, int pitch, ptq1_pascal_fusion fusion) {
++    extern __shared__ float partial[];
++    float * pg = partial + Rows*kblocks;
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
++    const int row0 = blockIdx.x*Rows;
++    const uint32_t * a = activations + size_t(blockIdx.y)*36*pitch;
++    if constexpr (Flat) {
++        for (int work = tid; work < Rows*kblocks; work += Threads) {
++            const int r = work/kblocks, kb = work%kblocks;
++            float value = 0, gate = 0;
++            if (row0+r < rows) {
++                value = ptq1_pascal_dot<Raw,Cache>(weights + size_t(row0+r)*row_stride + kb, a, pitch, kb);
++                if (fusion.gate) gate = ptq1_pascal_dot<Raw,Cache>(fusion.gate + size_t(row0+r)*row_stride + kb, a, pitch, kb);
++            }
++            partial[r*kblocks+kb] = value;
++            if (fusion.gate) pg[r*kblocks+kb] = gate;
++        }
++    } else {
++        for (int r = warp; r < Rows; r += Threads/32) {
++            for (int kb = lane; kb < kblocks; kb += 32) {
++                float value = 0, gate = 0;
++                if (row0+r < rows) {
++                    value = ptq1_pascal_dot<Raw,Cache>(weights + size_t(row0+r)*row_stride + kb, a, pitch, kb);
++                    if (fusion.gate) gate = ptq1_pascal_dot<Raw,Cache>(fusion.gate + size_t(row0+r)*row_stride + kb, a, pitch, kb);
++                }
++                partial[r*kblocks+kb] = value;
++                if (fusion.gate) pg[r*kblocks+kb] = gate;
++            }
++        }
++    }
++    __syncthreads();
++    for (int r = warp; r < Rows; r += Threads/32) {
++        float value = 0, gate = 0;
++        for (int kb = lane; kb < kblocks; kb += 32) {
++            value += partial[r*kblocks+kb];
++            if (fusion.gate) gate += pg[r*kblocks+kb];
++        }
++        value = warp_reduce_sum(value);
++        gate = warp_reduce_sum(gate);
++        if (lane == 0 && row0+r < rows) {
++            const int row = row0+r;
++            if (fusion.bias) value += __ldg(fusion.bias+row);
++            if (fusion.gate) {
++                if (fusion.gate_bias) gate += __ldg(fusion.gate_bias+row);
++                switch (fusion.op) {
++                    case GGML_GLU_OP_SWIGLU: value *= ggml_cuda_op_silu_single(gate); break;
++                    case GGML_GLU_OP_GEGLU: value *= ggml_cuda_op_gelu_single(gate); break;
++                    case GGML_GLU_OP_SWIGLU_OAI: value = ggml_cuda_op_swiglu_oai_single(gate,value); break;
++                    case GGML_GLU_OP_SWIGLU_CLAMP: value = ggml_cuda_op_swiglu_clamp_single(gate,value,fusion.limit); break;
++                    default: value *= gate; break;
++                }
++            }
++            dst[size_t(blockIdx.y)*dst_stride+row] = value;
++        }
++    }
++}
++
++// Reuse the expensive base-3 weight decode across a small verification batch.
++// Each column retains the single-column integer accumulation and reduction order.
++template<int Columns>
++static __device__ __forceinline__ void ptq1_pascal_dot_multi(
++        const block_ptq1_0 * w, const uint32_t * a, int pitch, int kb, float (&result)[Columns]) {
++    int acc[Columns][4] = {};
++    const uint32_t * wp = (const uint32_t *) w;
++    uint32_t packed = ptq1_pascal_weight(wp);
++#pragma unroll
++    for (int g = 0; g < 6; ++g) {
++        const uint32_t next = ptq1_pascal_weight(wp + g + 1);
++        uint32_t lo = __byte_perm(packed, 0, 0x4140);
++        uint32_t hi = __byte_perm(packed, 0, 0x4342);
++#pragma unroll
++        for (int t = 0; t < 5; ++t) {
++            const uint32_t wl = lo * 3, wh = hi * 3;
++            lo = wl & 0x00ff00ff; hi = wh & 0x00ff00ff;
++            const int trits = __byte_perm(wl, wh, 0x7531);
++            const int e = g < 4 ? t*16 + 4*g : 80 + t*8 + 4*(g-4);
++#pragma unroll
++            for (int c = 0; c < Columns; ++c) {
++                const int q = __ldg(a + (size_t(c)*36 + e/4)*pitch + kb);
++                acc[c][e/32] = ggml_cuda_dp4a(trits, q, acc[c][e/32]);
++            }
++        }
++        packed = next;
++    }
++    uint32_t v = (packed & 255u) | ((packed & 0xff00u) << 8);
++#pragma unroll
++    for (int t = 0; t < 4; t += 2) {
++        const uint32_t w0 = v*3; v = w0 & 0x00ff00ff;
++        const uint32_t w1 = v*3; v = w1 & 0x00ff00ff;
++        const int trits = __byte_perm(w0, w1, 0x7531);
++#pragma unroll
++        for (int c = 0; c < Columns; ++c) {
++            const int q = __ldg(a + (size_t(c)*36 + 30+t/2)*pitch + kb);
++            acc[c][3] = ggml_cuda_dp4a(trits, q, acc[c][3]);
++        }
++    }
++#pragma unroll
++    for (int c = 0; c < Columns; ++c) {
++        result[c] = 0;
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            const uint32_t meta = __ldg(a + (size_t(c)*36 + 32+j)*pitch + kb);
++            acc[c][j] -= int(int16_t(meta >> 16));
++            result[c] += __half2float(__ushort_as_half(meta & 65535)) * float(acc[c][j]);
++        }
++        result[c] *= __half2float(__ushort_as_half(packed >> 16));
++    }
++}
++
++template<int Columns>
++__launch_bounds__(96, 2)
++static __global__ void mul_mat_vec_ptq1_pascal_multi(const block_ptq1_0 * weights,
++        const uint32_t * activations, float * dst, int kblocks, int rows,
++        int row_stride, int dst_stride, int pitch, const float * bias) {
++    extern __shared__ float partial[];
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
++    const int row0 = blockIdx.x*4;
++    for (int work = tid; work < 4*kblocks; work += 96) {
++        const int r = work/kblocks, kb = work%kblocks;
++        float value[Columns] = {};
++        if (row0+r < rows) ptq1_pascal_dot_multi<Columns>(
++            weights + size_t(row0+r)*row_stride + kb, activations, pitch, kb, value);
++#pragma unroll
++        for (int c = 0; c < Columns; ++c) partial[(c*4+r)*kblocks+kb] = value[c];
++    }
++    __syncthreads();
++    for (int cr = warp; cr < 4*Columns; cr += 3) {
++        const int c = cr/4, r = cr%4;
++        float value = 0;
++        for (int kb = lane; kb < kblocks; kb += 32) value += partial[cr*kblocks+kb];
++        value = warp_reduce_sum(value);
++        if (lane == 0 && row0+r < rows) {
++            if (bias) value += __ldg(bias+row0+r);
++            dst[size_t(c)*dst_stride+row0+r] = value;
++        }
++    }
++}
++
++struct ptq1_pascal_config { int threads; int rows; bool flat; };
++
++// Explicit variants are retained for reproducible device-local tuning.
++static inline ptq1_pascal_config ptq1_pascal_select(int k) {
++    static const char * variant = getenv("GGML_CUDA_PTQ1_PASCAL_GEMV");
++    ptq1_pascal_config c = k <= 6144 ? ptq1_pascal_config{96,4,true} :
++        ptq1_pascal_config{128,4,false};
++    if (!variant || !strcmp(variant,"auto") || !strcmp(variant,"on")) return c;
++    for (int threads : {96,128,160,192}) for (int rows : {1,2,4}) for (bool flat : {true,false}) {
++        char name[32]; snprintf(name,sizeof(name),"%d-%d-%s",threads,rows,flat?"flat":"warp");
++        if (!strcmp(name,variant)) return {threads,rows,flat};
++    }
++    GGML_ABORT("Invalid GGML_CUDA_PTQ1_PASCAL_GEMV: %s",variant);
++}
++
++template<int Threads,int Rows,bool Raw=true,bool Cache=true>
++static void ptq1_pascal_launch_ownership(bool flat, const block_ptq1_0 * w, const uint32_t * a,
++        float * dst,int k,int rows,int columns,int row_stride,int dst_stride,
++        ptq1_pascal_fusion fusion,cudaStream_t stream) {
++    const size_t shared = size_t(Rows)*(k/128)*sizeof(float)*(fusion.gate?2:1);
++    const ggml_cuda_kernel_launch_params lp(dim3((rows+Rows-1)/Rows,columns,1),dim3(Threads,1,1),shared,stream);
++    if (flat) ggml_cuda_kernel_launch(mul_mat_vec_ptq1_pascal<Threads,Rows,true,Raw,Cache>,lp,
++        w,a,dst,k/128,rows,row_stride,dst_stride,ptq1_pascal_pitch(k),fusion);
++    else ggml_cuda_kernel_launch(mul_mat_vec_ptq1_pascal<Threads,Rows,false,Raw,Cache>,lp,
++        w,a,dst,k/128,rows,row_stride,dst_stride,ptq1_pascal_pitch(k),fusion);
++}
++
++static void ptq1_pascal_launch(ptq1_pascal_config c,const block_ptq1_0 * w,const uint32_t * a,
++        float * dst,int k,int rows,int columns,int row_stride,int dst_stride,
++        ptq1_pascal_fusion fusion,cudaStream_t stream) {
++    static const bool multi_enabled = [] {
++        const char * s = getenv("GGML_CUDA_PTQ1_PASCAL_MULTI");
++        return s && !strcmp(s,"on");
++    }();
++    if (multi_enabled && columns >= 2 && columns <= 4 && k <= 6144 && !fusion.gate) {
++        const size_t shared = size_t(4)*columns*(k/128)*sizeof(float);
++        const ggml_cuda_kernel_launch_params lp(dim3((rows+3)/4,1,1),dim3(96,1,1),shared,stream);
++#define PTQ1_MULTI(N) if (columns == N) { \
++        ggml_cuda_kernel_launch(mul_mat_vec_ptq1_pascal_multi<N>,lp, \
++            w,a,dst,k/128,rows,row_stride,dst_stride,ptq1_pascal_pitch(k),fusion.bias); return; }
++        PTQ1_MULTI(2) PTQ1_MULTI(3) PTQ1_MULTI(4)
++#undef PTQ1_MULTI
++    }
++#define PTQ1_CASE(T,R) if(c.threads==T && c.rows==R) { \
++    ptq1_pascal_launch_ownership<T,R>(c.flat,w,a,dst,k,rows,columns,row_stride,dst_stride,fusion,stream); return; }
++    PTQ1_CASE(96,1) PTQ1_CASE(96,2) PTQ1_CASE(96,4)
++    PTQ1_CASE(128,1) PTQ1_CASE(128,2) PTQ1_CASE(128,4)
++    PTQ1_CASE(160,1) PTQ1_CASE(160,2) PTQ1_CASE(160,4)
++    PTQ1_CASE(192,1) PTQ1_CASE(192,2) PTQ1_CASE(192,4)
++#undef PTQ1_CASE
++    GGML_ABORT("Unsupported Pascal PTQ1 GEMV geometry");
++}
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 971846f98..c18b66846 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -59,6 +59,10 @@ struct ggml_cuda_mmvq_fusion_args_device : ggml_cuda_mm_fusion_args_device {
+     bool prefetch_weights = false; // immutable dense weights only
+ };
+ 
++#if !defined(GGML_USE_HIP)
++#include "mmvq-ptq1-pascal.cuh"
++#endif
++
+ typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
+ 
+ #if !defined(GGML_USE_HIP)
+@@ -1534,11 +1538,14 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+     return 1;
+ }
+ 
+-static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
++static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
+         switch (ncols_dst) {
+             case 1:
+-                return small_k ? nwarps : 1;
++                // SM 6.1 uses the generic table. Group four PTQ1 output rows per
++                // block so the Q8 activation row can be reused in the kernel.
++                // Keep other quant types and architectures on their established path.
++                return small_k ? nwarps : (type == GGML_TYPE_PTQ1_0 && table_id == MMVQ_PARAMETERS_GENERIC ? 4 : 1);
+             case 2:
+             case 3:
+             case 4:
+@@ -1591,7 +1598,7 @@ static __global__ void mul_mat_vec_q(
+     constexpr int vdr = get_vdr_mmvq(type);
+     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
+     constexpr int nwarps = nwarps_override > 0 ? nwarps_override : calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
++    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+ 
+     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+@@ -2109,7 +2116,7 @@ static std::pair<dim3, dim3> calc_launch_params(
+         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
+         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
+     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
++    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
+     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
+     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
+     const dim3 block_dims(warp_size, nwarps, 1);
+@@ -2795,6 +2802,41 @@ static void ggml_cuda_mul_mat_vec_q_impl(
+     }
+ 
+     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
++#if !defined(GGML_USE_HIP)
++    static const bool pascal_gemv_enabled = [] {
++        const char * s = getenv("GGML_CUDA_PTQ1_PASCAL_GEMV");
++        return !s || strcmp(s,"off");
++    }();
++    static const bool pascal_gemv_auto = [] {
++        const char * s = getenv("GGML_CUDA_PTQ1_PASCAL_GEMV");
++        return !s || !strcmp(s,"auto") || !strcmp(s,"on");
++    }();
++    // Dense PTQ1-only operand layout. Keep all unsupported batches, MoE,
++    // tensor-split launchers and architectures on their existing Q8 contract.
++    if (pascal_gemv_enabled && (!pascal_gemv_auto || ne10 <= 6144) &&
++        src0->type == GGML_TYPE_PTQ1_0 &&
++        ggml_cuda_info().devices[ctx.device].cc == 610 && !ids && !fp8_marker &&
++        !post_silu && post_scale == 1.0f && !conv_prefix && ne11 >= 1 && ne11 <= 4 &&
++        ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
++        ne2 == 1 && ne3 == 1 && ne00 == ne10 && ne10 % 128 == 0 &&
++        (!fusion || (!fusion->x_scale && !fusion->gate_scale && !fusion->residual))) {
++        const auto cfg = ptq1_pascal_select(ne10);
++        const size_t shared = size_t(cfg.rows)*(ne10/128)*sizeof(float)*(fusion_local.gate?2:1);
++        if (shared <= 48*1024) {
++            ggml_cuda_pool_alloc<uint32_t> a(ctx.pool(),ptq1_pascal_bytes(ne10,ne11)/sizeof(uint32_t));
++            if (fwht_input) ggml_cuda_fwht_q8_1(ctx,fwht_input,fwht_signs,a.get(),true);
++            else quantize_ptq1_pascal_cuda(src1_d,a.get(),ne10,ne11,nb11/ts_src1,stream);
++            ptq1_pascal_fusion pf{};
++            pf.gate = (const block_ptq1_0 *) fusion_local.gate;
++            pf.bias = (const float *) fusion_local.x_bias;
++            pf.gate_bias = (const float *) fusion_local.gate_bias;
++            pf.op = fusion_local.glu_op; pf.limit = fusion_local.glu_limit;
++            ptq1_pascal_launch(cfg,(const block_ptq1_0 *)src0->data,a.get(),dst_d,
++                ne10,ne01,ne11,nb01/ts_src0,nb1/ts_dst,pf,stream);
++            return;
++        }
++    }
++#endif
+     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+ #if !defined(GGML_USE_HIP)
+     if (fp8_marker) {
+diff --git a/ggml/src/ggml-cuda/ptq1-pascal-layout.cuh b/ggml/src/ggml-cuda/ptq1-pascal-layout.cuh
+new file mode 100644
+index 000000000..33d758519
+--- /dev/null
++++ b/ggml/src/ggml-cuda/ptq1-pascal-layout.cuh
+@@ -0,0 +1,30 @@
++#pragma once
++#include "common.cuh"
++
++// Internal GEMV-only operand: 32 planes of Q8 words followed by four planes
++// of (FP16 scale, exact signed INT16 quant sum). K-block lanes read adjacent
++// words. Neither the GGUF weights nor the generic/MMQ Q8 layout changes.
++static __host__ __device__ inline int ptq1_pascal_pitch(int k) { return ((k/128+31)/32)*32; }
++static inline size_t ptq1_pascal_bytes(int k, int columns) {
++    return size_t(36) * ptq1_pascal_pitch(k) * columns * sizeof(uint32_t);
++}
++
++static __device__ __forceinline__ void ptq1_pascal_store_q8(
++        uint32_t * dst, int pitch, int column, int element, int q, float d) {
++    const int lane = threadIdx.x & 31;
++    const int word = ((element & 127) >> 2);
++    const int kb = element / 128;
++    const uint32_t packed = (uint32_t(q) & 255u) |
++        ((uint32_t(__shfl_down_sync(0xffffffff, q, 1)) & 255u) << 8) |
++        ((uint32_t(__shfl_down_sync(0xffffffff, q, 2)) & 255u) << 16) |
++        ((uint32_t(__shfl_down_sync(0xffffffff, q, 3)) & 255u) << 24);
++    int sum = warp_reduce_sum(q);
++    if ((lane & 3) == 0) dst[(size_t(column)*36 + word)*pitch + kb] = packed;
++    if (lane == 0) {
++        const uint32_t meta = uint32_t(__half_as_ushort(__float2half(d))) | (uint32_t(uint16_t(sum)) << 16);
++        dst[(size_t(column)*36 + 32 + ((element & 127) >> 5))*pitch + kb] = meta;
++    }
++}
++
++void quantize_ptq1_pascal_cuda(const float * x, uint32_t * dst,
++        int k, int columns, int64_t stride, cudaStream_t stream);
+diff --git a/ggml/src/ggml-cuda/quantize.cu b/ggml/src/ggml-cuda/quantize.cu
+index 683f8e0b8..275b4e4ee 100644
+--- a/ggml/src/ggml-cuda/quantize.cu
++++ b/ggml/src/ggml-cuda/quantize.cu
+@@ -1,5 +1,25 @@
+ #include "quantize.cuh"
+ #include <cstdint>
++#if !defined(GGML_USE_HIP)
++#include "ptq1-pascal-layout.cuh"
++
++static __global__ void quantize_ptq1_pascal(const float * x, uint32_t * dst,
++        int k, int64_t stride, int pitch) {
++    const int i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= k) return; // K is a multiple of 128: complete warps only.
++    const float v = x[int64_t(blockIdx.y)*stride + i];
++    const float amax = warp_reduce_max<32>(fabsf(v));
++    const float d = amax / 127.0f;
++    const int q = amax == 0.0f ? 0 : int(roundf(v / d));
++    ptq1_pascal_store_q8(dst, pitch, blockIdx.y, i, q, d);
++}
++
++void quantize_ptq1_pascal_cuda(const float * x, uint32_t * dst,
++        int k, int columns, int64_t stride, cudaStream_t stream) {
++    const ggml_cuda_kernel_launch_params launch(dim3((k+255)/256, columns, 1), dim3(256,1,1), 0, stream);
++    ggml_cuda_kernel_launch(quantize_ptq1_pascal, launch, x, dst, k, stride, ptq1_pascal_pitch(k));
++}
++#endif
+ 
+ #if defined(BLACKWELL_MMA_AVAILABLE)
+ // this maps to 256-bit loads in PTX on supported devices,
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index b21514730..beb9b4a88 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -1010,3 +1010,13 @@ endif()
+ llama_build(test-turbo3-native.cpp)
+ target_include_directories(test-turbo3-native PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+ llama_test(test-turbo3-native NAME test-turbo3-native LABEL cuda)
++
++if (GGML_CUDA AND NOT GGML_HIP)
++    add_executable(test-ptq1-pascal test-ptq1-pascal.cu)
++    target_include_directories(test-ptq1-pascal PRIVATE ../ggml/src ../ggml/src/ggml-cuda)
++    target_link_libraries(test-ptq1-pascal PRIVATE ggml ggml-cuda)
++    target_compile_options(test-ptq1-pascal PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-use_fast_math>)
++    set_target_properties(test-ptq1-pascal PROPERTIES CUDA_STANDARD 17)
++    llama_test(test-ptq1-pascal NAME test-ptq1-pascal LABEL cuda)
++    set_tests_properties(test-ptq1-pascal PROPERTIES SKIP_RETURN_CODE 77)
++endif()
+diff --git a/tests/test-ptq1-pascal.cu b/tests/test-ptq1-pascal.cu
+new file mode 100644
+index 000000000..8d0b55b98
+--- /dev/null
++++ b/tests/test-ptq1-pascal.cu
+@@ -0,0 +1,144 @@
++#include "mmvq-ptq1-pascal.cuh"
++#include "vecdotq.cuh"
++#include "quantize.cuh"
++#include "ggml-cuda.h"
++#include "ggml-impl.h"
++#include <vector>
++#include <random>
++#include <cstdio>
++#include <functional>
++
++static __global__ void reference(const block_ptq1_0 * w,const block_q8_1 * a,
++        float * dst,int k,int m,int padded) {
++    float v = 0;
++    for (int kb = threadIdx.x; kb < k/128; kb += 32)
++        v += vec_dot_ptq1_0_q8_1_cuda(w+size_t(blockIdx.x)*(k/128),
++            a+size_t(blockIdx.y)*(padded/32),kb,4*kb);
++    v = warp_reduce_sum(v);
++    if (threadIdx.x == 0) dst[size_t(blockIdx.y)*m+blockIdx.x] = v;
++}
++
++static float timing(const std::function<void()> & f) {
++    for(int i=0;i<5;++i) f();
++    CUDA_CHECK(cudaDeviceSynchronize());
++    cudaEvent_t start,end; CUDA_CHECK(cudaEventCreate(&start));CUDA_CHECK(cudaEventCreate(&end));
++    CUDA_CHECK(cudaEventRecord(start));
++    for(int i=0;i<40;++i) f();
++    CUDA_CHECK(cudaEventRecord(end));CUDA_CHECK(cudaEventSynchronize(end));
++    float ms;CUDA_CHECK(cudaEventElapsedTime(&ms,start,end));
++    CUDA_CHECK(cudaEventDestroy(start));CUDA_CHECK(cudaEventDestroy(end));return ms/40;
++}
++
++static void shape(int k,int m,int n,bool bench,bool extreme=false) {
++    std::mt19937 rng(1234+k+m+n);
++    std::vector<block_ptq1_0> hw(size_t(k/128)*m);
++    for(auto & b:hw) {
++        for(auto & q:b.qs) q=rng()%243;
++        for(auto & q:b.qh) q=rng()%81;
++        b.d=__float2half(float(1+rng()%16)/32);
++    }
++    std::vector<float> hx(k*n);
++    for(size_t i=0;i<hx.size();++i) hx[i]=extreme ?
++        (i/32%3==0 ? 0.0f : (i%32==0 ? 127.0f : (i%3==0 ? -126.0f : 3.25f))) :
++        float(int(rng()%20001)-10000)/3333;
++    block_ptq1_0 * w;float * x,* dst,* ref;uint32_t * a;block_q8_1 * aos;
++    const int padded=GGML_PAD(k,MATRIX_ROW_PADDING);
++    CUDA_CHECK(cudaMalloc(&w,hw.size()*sizeof(*w)));CUDA_CHECK(cudaMalloc(&x,hx.size()*4));
++    CUDA_CHECK(cudaMalloc(&a,ptq1_pascal_bytes(k,n)));CUDA_CHECK(cudaMalloc(&aos,size_t(padded/32)*n*sizeof(*aos)));
++    CUDA_CHECK(cudaMalloc(&dst,size_t(m)*n*4));CUDA_CHECK(cudaMalloc(&ref,size_t(m)*n*4));
++    CUDA_CHECK(cudaMemcpy(w,hw.data(),hw.size()*sizeof(*w),cudaMemcpyHostToDevice));
++    CUDA_CHECK(cudaMemcpy(x,hx.data(),hx.size()*4,cudaMemcpyHostToDevice));
++    quantize_ptq1_pascal_cuda(x,a,k,n,k,nullptr);
++    quantize_row_q8_1_cuda(x,nullptr,aos,GGML_TYPE_PTQ1_0,k,k,k*n,k*n,padded,n,1,1,nullptr);
++    reference<<<dim3(m,n),32>>>(w,aos,ref,k,m,padded);
++    CUDA_CHECK(cudaGetLastError());CUDA_CHECK(cudaDeviceSynchronize());
++    std::vector<float> expected(size_t(m)*n),out(expected.size());
++    CUDA_CHECK(cudaMemcpy(expected.data(),ref,expected.size()*4,cudaMemcpyDeviceToHost));
++    // Verify every activation byte, FP16 scale and exact integer sum against
++    // the existing AoS quantizer. Never use rounded floating-point sums.
++    std::vector<uint32_t> ha(ptq1_pascal_bytes(k,n)/4);
++    std::vector<block_q8_1> hq(size_t(padded/32)*n);
++    CUDA_CHECK(cudaMemcpy(ha.data(),a,ha.size()*4,cudaMemcpyDeviceToHost));
++    CUDA_CHECK(cudaMemcpy(hq.data(),aos,hq.size()*sizeof(*aos),cudaMemcpyDeviceToHost));
++    const int pitch=ptq1_pascal_pitch(k);
++    for(int col=0;col<n;++col) for(int kb=0;kb<k/128;++kb) for(int j=0;j<4;++j) {
++        const auto & b=hq[col*(padded/32)+kb*4+j];int sum=0;
++        for(int e=0;e<32;++e) {
++            sum+=b.qs[e];
++            uint32_t word=ha[(size_t(col)*36+j*8+e/4)*pitch+kb];
++            if(int8_t(word>>(8*(e%4)))!=b.qs[e]) GGML_ABORT("Q8 byte mismatch");
++        }
++        uint32_t meta=ha[(size_t(col)*36+32+j)*pitch+kb];
++        uint16_t d;memcpy(&d,&b.ds,2);
++        if((meta&65535)!=d || int16_t(meta>>16)!=sum) GGML_ABORT("Q8 scale/sum mismatch");
++    }
++    // Independent scalar CPU arithmetic on selected output rows.
++    const auto * traits=ggml_get_type_traits(GGML_TYPE_PTQ1_0);
++    std::vector<float> deq(k);
++    for(int row : {0,m/2,m-1}) {
++        traits->to_float(hw.data()+size_t(row)*(k/128),deq.data(),k);
++        for(int col=0;col<n;++col) {
++            double value=0;
++            for(int e=0;e<k;++e) {
++                const auto & b=hq[col*(padded/32)+e/32];ggml_fp16_t d;memcpy(&d,&b.ds,2);
++                value+=double(deq[e])*GGML_FP16_TO_FP32(d)*int(b.qs[e%32]);
++            }
++            if(fabs(value-expected[size_t(col)*m+row])>1e-4*(1+fabs(value)))
++                GGML_ABORT("CPU oracle mismatch k=%d m=%d n=%d row=%d col=%d cpu=%g gpu=%g scale=%g",
++                    k,m,n,row,col,value,expected[size_t(col)*m+row],__half2float(hw[0].d));
++        }
++    }
++    double quant_us = bench ? timing([&]{quantize_ptq1_pascal_cuda(x,a,k,n,k,nullptr);})*1000 : 0;
++    for(int threads:{96,128,160,192}) for(int rows:{1,2,4}) for(bool flat:{true,false}) {
++        auto launch=[&]{ptq1_pascal_launch({threads,rows,flat},w,a,dst,k,m,n,k/128,m,{},nullptr);};
++        launch();CUDA_CHECK(cudaDeviceSynchronize());
++        CUDA_CHECK(cudaMemcpy(out.data(),dst,out.size()*4,cudaMemcpyDeviceToHost));
++        double err=0,norm=0,maxabs=0;
++        for(size_t i=0;i<out.size();++i) {double d=out[i]-expected[i];err+=d*d;norm+=double(expected[i])*expected[i];maxabs=fmax(maxabs,fabs(d));}
++        if(!std::isfinite(err) || err/fmax(norm,1e-30)>1e-10) GGML_ABORT("Pascal PTQ1 oracle mismatch");
++        double us=bench ? timing(launch)*1000 : 0;
++        printf("{\"k\":%d,\"m\":%d,\"n\":%d,\"threads\":%d,\"rows\":%d,\"ownership\":\"%s\",\"gemv_us\":%.6f,\"quant_us\":%.6f,\"nmse\":%.12g,\"max_abs\":%.8g}\n",
++            k,m,n,threads,rows,flat?"flat":"warp",us,quant_us,err/fmax(norm,1e-30),maxabs);
++        fflush(stdout);
++    }
++    if (bench) {
++        const auto c=ptq1_pascal_select(k);
++        // Isolate raw-digit correction and GP104 read-only caching while
++        // holding geometry, Q8 bytes, and the weight lookahead unchanged.
++        double normal=timing([&]{ptq1_pascal_launch(c,w,a,dst,k,m,n,k/128,m,{},nullptr);})*1000;
++        double centered,uncached;
++        auto verify=[&] {
++            CUDA_CHECK(cudaMemcpy(out.data(),dst,out.size()*4,cudaMemcpyDeviceToHost));
++            double err=0,norm=0;
++            for(size_t i=0;i<out.size();++i) {double d=out[i]-expected[i];err+=d*d;norm+=double(expected[i])*expected[i];}
++            if(!std::isfinite(err) || err/fmax(norm,1e-30)>1e-10) GGML_ABORT("Ablation oracle mismatch");
++        };
++#define PTQ1_ABLATE(T,R) \
++        centered=timing([&]{ptq1_pascal_launch_ownership<T,R,false,true>(c.flat,w,a,dst,k,m,n,k/128,m,{},nullptr);})*1000; verify(); \
++        uncached=timing([&]{ptq1_pascal_launch_ownership<T,R,true,false>(c.flat,w,a,dst,k,m,n,k/128,m,{},nullptr);})*1000; verify();
++        if(c.threads==96 && c.rows==4) {PTQ1_ABLATE(96,4)}
++        else if(c.threads==96 && c.rows==2) {PTQ1_ABLATE(96,2)}
++        else {PTQ1_ABLATE(128,4)}
++#undef PTQ1_ABLATE
++        printf("{\"ablation\":true,\"k\":%d,\"m\":%d,\"n\":%d,\"threads\":%d,\"rows\":%d,\"ownership\":\"%s\",\"raw_ldg_us\":%.6f,\"centered_ldg_us\":%.6f,\"raw_l2_us\":%.6f}\n",
++            k,m,n,c.threads,c.rows,c.flat?"flat":"warp",normal,centered,uncached);
++    }
++    CUDA_CHECK(cudaFree(w));CUDA_CHECK(cudaFree(x));CUDA_CHECK(cudaFree(a));CUDA_CHECK(cudaFree(aos));CUDA_CHECK(cudaFree(dst));CUDA_CHECK(cudaFree(ref));
++}
++
++int main(int argc,char ** argv) {
++    ggml_context * init=ggml_init({1024,nullptr,true});ggml_free(init);
++    ggml_backend_t backend=ggml_backend_cuda_init(0);
++    if(!backend) return 1;
++    const auto & device=ggml_cuda_info().devices[0];
++    if(device.cc!=610) {fprintf(stderr,"This sweep targets sm_61; detected %d\n",device.cc);ggml_backend_free(backend);return 77;}
++    bool bench=argc>1 && !strcmp(argv[1],"--bench");
++    if(bench && argc==5) shape(atoi(argv[2]),atoi(argv[3]),atoi(argv[4]),true);
++    else if(bench) for(auto s: std::initializer_list<std::pair<int,int>>{{5120,1024},{5120,6144},{5120,10240},{5120,12288},{5120,17408},{6144,5120},{17408,5120},{5120,248320}})
++        for(int n:{1,2,4}) shape(s.first,s.second,n,true);
++    else {
++        for(int k:{128,384,4096,5120,6144,17408}) for(int n:{1,2,3,4}) shape(k,37,n,false);
++        shape(5120,37,4,false,true);
++    }
++    ggml_backend_free(backend);return 0;
++}
+-- 
+2.43.0
+

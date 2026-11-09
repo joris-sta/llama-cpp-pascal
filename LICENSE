@@ -1,0 +1,8 @@
+MIT License
+
+Copyright (c) 2026 joris-sta
+
+The modifications in this repository are released under the MIT License.
+LLaMA.cpp, of which this work is an extension, is Copyright (c) of the
+ggml-org/llama.cpp authors and contributors and also licensed under the
+MIT License.
