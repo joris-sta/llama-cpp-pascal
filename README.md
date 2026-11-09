@@ -1,4 +1,4 @@
-# llama.cpp — pre-tensor-core (Pascal) inference optimizations
+# Pre-Tensor-Core Inference for llama.cpp: PTQ1 Ternary, Gated-Delta-Net, and Turbo3 Kernels, +50–70% Faster on Pascal
 
 <p align="center">
   <img src="pagefront.png" alt="A cat about to start writing CUDA on its laptop sits perched on a GTX 1070 (8 GB / SM 6.1, no tensor cores); the tabby's long Turbo3-branded tail stretches out like a KV cache, labeled 80K, 128K and 262K tokens" width="100%">
