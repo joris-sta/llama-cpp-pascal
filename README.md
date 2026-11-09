@@ -16,13 +16,13 @@
 >
 > **Average result.** +50–70% generation speed on the 27B ternary model from
 > the decode kernels alone at 512-token to 32K depth, +49% prompt processing
-> on ternary weights at parity perplexity, and a further 1.4–2.7× end-to-end
-> from n-gram speculative decoding with byte-identical output.
+> on ternary weights at parity perplexity, and +15–34% deeper-context decode
+> for the recurrent-hybrid family.
 >
 > **Two verified examples.**
 > - **Bonsai-2-27B (PTQ1 ternary quants):** production server at ~80–96K
->   context; 15.3 → 26.9 tok/s on edit-style tasks and 15.3 → 41.1 tok/s on
->   copy-style tasks with speculation, all outputs identical.
+>   context; 6.4 → 10.9 tok/s at shallow depth and 5.7 → 8.7 tok/s at a
+>   filled 32K window from the decode kernels alone, outputs identical.
 > - **Qwen3.5-native 9B hybrid:** 335 tok/s at a filled 32K window; +15–34%
 >   decode at 32–128K depth, the top end at a full 128K window (8.6 → 11.5
 >   tok/s) with identical greedy output.
