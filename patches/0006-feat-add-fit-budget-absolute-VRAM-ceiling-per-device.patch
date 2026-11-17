@@ -1,0 +1,122 @@
+From 1b8c3d7a745191a4e6376a51b1491defdbfd5994 Mon Sep 17 00:00:00 2001
+From: Enelbit <enelbit@gmail.com>
+Date: Tue, 17 Nov 2026 17:41:32 +0100
+Subject: [PATCH] feat: add --fit-budget absolute VRAM ceiling per device
+
+---
+ common/arg.cpp    | 20 ++++++++++++++++++++
+ common/common.cpp |  1 +
+ common/common.h   |  1 +
+ common/fit.cpp    |  7 ++++++-
+ common/fit.h      |  1 +
+ 5 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 636e4ae2f..c889ed5c8 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -4131,6 +4131,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             }
+         }
+     ).set_env("LLAMA_ARG_FIT_TARGET"));
++    add_opt(common_arg(
++        { "--fit-budget" }, "MiB0,MiB1,MiB2,...",
++        "absolute VRAM ceiling per device in MiB for --fit (0 = disabled, single value broadcast to all devices)",
++        [](common_params & params, const std::string & value) {
++            const std::vector<std::string> split_arg = string_split<std::string>(value, ',');
++            if (split_arg.size() > llama_max_devices()) {
++                throw std::invalid_argument(string_format("got %zu budgets but only %zu devices are supported", split_arg.size(), llama_max_devices()));
++            }
++            const auto mib = [](const std::string & v) -> size_t {
++                if (v.empty() || v[0] == '-') {
++                    throw std::invalid_argument("--fit-budget takes non-negative MiB values");
++                }
++                return std::stoull(v) * 1024*1024;
++            };
++            params.fit_params_budget.assign(llama_max_devices(), mib(split_arg[0]));
++            for (size_t i = 1; i < split_arg.size(); i++) {
++                params.fit_params_budget[i] = mib(split_arg[i]);
++            }
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_FIT_PARAMS}));
+     add_opt(common_arg(
+         { "-fitc", "--fit-ctx" }, "N",
+         string_format("minimum ctx size that can be set by --fit option, default: %" PRIu32, params.fit_params_min_ctx),
+diff --git a/common/common.cpp b/common/common.cpp
+index b418e07d7..4a58d51b1 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1530,6 +1530,7 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+             params.fit_params_min_ctx,
+             has_draft || spec_mtp ? &extra_dft : nullptr,
+             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR,
++            params.fit_params_budget.data(),
+             !params.n_ubatch_auto ? 0 : params.n_batch_explicit ? params.n_batch : UINT32_MAX,
+             !params.split_mode_explicit && params.lora_adapters.empty());
+         if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+diff --git a/common/common.h b/common/common.h
+index d80d9db3b..22cc31fd8 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -653,6 +653,7 @@ struct common_params {
+ 
+     // margin per device in bytes for fitting parameters to free memory:
+     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
++    std::vector<size_t> fit_params_budget = std::vector<size_t>(llama_max_devices(), 0); // absolute VRAM ceiling per device in bytes, 0 = disabled
+     // Server-side auxiliary reservations may raise fit_params_target. Dynamic VBR should retain
+     // the caller's ordinary per-device safety headroom and account auxiliaries through live free
+     // memory instead of treating their bytes as permanently unavailable a second time.
+diff --git a/common/fit.cpp b/common/fit.cpp
+index 84b2ab8ae..e4f0937b9 100644
+--- a/common/fit.cpp
++++ b/common/fit.cpp
+@@ -841,7 +841,7 @@ static void common_params_fit_impl(
+         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
+         common_moe_cache_params * moe_cache, size_t * margins_s, uint32_t n_ctx_min,
+         const common_fit_extra_model * extra, enum ggml_log_level log_level,
+-        ggml_type type_k_entry, ggml_type type_v_entry) {
++        const size_t * budgets, ggml_type type_k_entry, ggml_type type_v_entry) {
+     // SPLIT_MODE_TENSOR runs through the single-device paths below: the model exposes exactly one
+     // meta device whose memory report is the balanced-equivalent aggregate of the real GPUs (see
+     // common_get_device_memory_data_impl) and whose margin is the sum of the per-device targets.
+@@ -1882,6 +1882,9 @@ static void common_params_fit_impl(
+     std::vector<int64_t> targets; // maximum acceptable memory use per device
+     targets.reserve(nd);
+     for (size_t id = 0; id < nd; id++) {
++        if (budgets && budgets[id] > 0) {
++            margins[id] = std::max(margins[id], (int64_t)dmds_full[id].free - (int64_t)budgets[id]);
++        }
+         targets.push_back(dmds_full[id].free - margins[id]);
+         LOG_TRC("%s: id=%zu, target=%" PRId64 " MiB\n", __func__, id, targets[id]/MiB);
+     }
+@@ -2834,6 +2837,7 @@ enum common_params_fit_status common_fit_params(
+         uint32_t n_ctx_min,
+         const common_fit_extra_model * extra,
+         ggml_log_level log_level,
++        const size_t * budgets,
+         uint32_t n_ubatch_max,
+         bool split_mode_auto) {
+     const int64_t t0_us = llama_time_us();
+@@ -2947,6 +2951,7 @@ enum common_params_fit_status common_fit_params(
+         try {
+             common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides,
+                     moe_cache, margins_ub.data(), n_ctx_min, extra, log_level,
++                    budgets,
+                     type_k_entry, type_v_entry);
+             LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
+             return COMMON_PARAMS_FIT_STATUS_SUCCESS;
+diff --git a/common/fit.h b/common/fit.h
+index e36857007..ae941894d 100644
+--- a/common/fit.h
++++ b/common/fit.h
+@@ -122,6 +122,7 @@ common_params_fit_status common_fit_params(
+                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
+       const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
+                      ggml_log_level   log_level,             // minimum log level to print during fitting, lower levels go to debug log
++                           const size_t * budgets = nullptr,          // absolute VRAM ceiling per device in bytes, nullptr = no budget
+                            uint32_t   n_ubatch_max = 0,      // > n_ubatch: raise n_ubatch up to this when weights stream per ubatch
+                                bool   split_mode_auto = false); // layer split may become tensor split for a model resident on several GPUs
+ 
+-- 
+2.56.1
+
